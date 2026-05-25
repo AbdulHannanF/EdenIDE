@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eden-app",
+    "crates/eden-ui",
+    "crates/eden-motion",
+    "crates/eden-editor",
+    "crates/eden-syntax",
+    "crates/eden-lsp",
+    "crates/eden-search",
+    "crates/eden-vcs",
+    "crates/eden-terminal",
+    "crates/eden-workspace",
+    "crates/eden-theme",
+    "crates/eden-plugin",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Eden contributors"]
+rust-version = "1.95"
+
+# Cross-cutting dependencies are declared centrally and pulled into each crate
+# with `dep.workspace = true`. We add heavier deps (tree-sitter, lsp, git2,
+# alacritty, …) to this table as the phase that needs them lands — there is no
+# point resolving the whole §2 stack before a window even opens.
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+eden-ui = { path = "crates/eden-ui" }
+eden-motion = { path = "crates/eden-motion" }
+eden-editor = { path = "crates/eden-editor" }
+eden-syntax = { path = "crates/eden-syntax" }
+eden-lsp = { path = "crates/eden-lsp" }
+eden-search = { path = "crates/eden-search" }
+eden-vcs = { path = "crates/eden-vcs" }
+eden-terminal = { path = "crates/eden-terminal" }
+eden-workspace = { path = "crates/eden-workspace" }
+eden-theme = { path = "crates/eden-theme" }
+eden-plugin = { path = "crates/eden-plugin" }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# design: the quality bar (§9) is `cargo clippy -- -D warnings`. We keep the
+# default lint set and treat warnings as errors in CI rather than here, so local
+# `cargo build` stays ergonomic.
+all = { level = "warn", priority = -1 }
+
+# design: vello + wgpu are effectively unusable at opt-level 0 (software-path
+# fallbacks dominate). Level 1 keeps debug builds interactive without paying the
+# full release compile cost.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,24 @@
+[package]
+name = "eden-app"
+description = "The Eden binary: window, GPU device, event loop, and glue."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+default-run = "eden"
+
+[[bin]]
+name = "eden"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+pollster = "0.4.0"
+tracing.workspace = true
+tracing-subscriber.workspace = true
+vello = "0.9.0"
+winit = "0.30.13"

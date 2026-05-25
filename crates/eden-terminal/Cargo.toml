@@ -1,0 +1,13 @@
+[package]
+name = "eden-terminal"
+description = "Embedded terminal for Eden — alacritty_terminal rendered through the vello pipeline."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

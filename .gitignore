@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Crash/profile dumps
+*.pdb
+profile.json
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

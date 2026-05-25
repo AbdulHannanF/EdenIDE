@@ -1,0 +1,13 @@
+[package]
+name = "eden-editor"
+description = "Buffer, cursors, selections, undo tree, and edit operations for Eden."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

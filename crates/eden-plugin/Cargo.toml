@@ -1,0 +1,13 @@
+[package]
+name = "eden-plugin"
+description = "Plugin host for Eden (WASM via wasmtime; stubbed in v1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
