@@ -149,10 +149,10 @@ impl Theme {
         toml::to_string_pretty(self)
     }
 
-    /// The three first-party themes, in presentation order.
+    /// The first-party themes, in presentation order.
     #[must_use]
-    pub fn builtins() -> [Theme; 3] {
-        [Self::eden_day(), Self::eden_dusk(), Self::eden_noir()]
+    pub fn builtins() -> [Theme; 4] {
+        [Self::eden_day(), Self::eden_dusk(), Self::eden_noir(), Self::eden_nothing()]
     }
 
     /// **Eden Day** — warm paper white, kingfisher-blue accent (§6).
@@ -175,15 +175,17 @@ impl Theme {
                 tab_active: Rgba8::rgb(0xFB, 0xF8, 0xF3),
                 selection: Rgba8::rgba(0x2A, 0x6B, 0xC8, 0x24),
             },
+            // design (D2): kingfisher keyword, amber string, deep-teal function,
+            // muted-violet type, rose number/constant, ink-grey operator.
             syntax: Syntax {
-                keyword: Rgba8::rgb(0x8A, 0x4F, 0xA0),
-                function: Rgba8::rgb(0x2A, 0x6B, 0xC8),
-                type_: Rgba8::rgb(0x2E, 0x7D, 0x6E),
+                keyword: Rgba8::rgb(0x2A, 0x6B, 0xC8),
+                function: Rgba8::rgb(0x1A, 0x7A, 0x5E),
+                type_: Rgba8::rgb(0x7B, 0x4C, 0xA8),
                 variable: Rgba8::rgb(0x2A, 0x2A, 0x30),
-                constant: Rgba8::rgb(0xB2, 0x5E, 0x2A),
-                string: Rgba8::rgb(0x3E, 0x7D, 0x44),
-                comment: Rgba8::rgb(0x8A, 0x85, 0x7A),
-                operator: Rgba8::rgb(0x6B, 0x68, 0x62),
+                constant: Rgba8::rgb(0xC7, 0x4C, 0x3C),
+                string: Rgba8::rgb(0xC7, 0x7B, 0x2C),
+                comment: Rgba8::rgb(0x8A, 0x8A, 0x8A),
+                operator: Rgba8::rgb(0x4A, 0x4A, 0x4F),
                 punctuation: Rgba8::rgb(0x6B, 0x68, 0x62),
                 attribute: Rgba8::rgb(0x9A, 0x6B, 0x2C),
             },
@@ -209,15 +211,17 @@ impl Theme {
                 tab_active: Rgba8::rgb(0x1A, 0x1F, 0x2E),
                 selection: Rgba8::rgba(0x3E, 0x9C, 0x92, 0x2E),
             },
+            // design (D2): muted sky keyword, warm-gold string, soft-teal
+            // function, lavender type, peach number, slate operator.
             syntax: Syntax {
-                keyword: Rgba8::rgb(0xC7, 0x92, 0xDB),
-                function: Rgba8::rgb(0x6F, 0xB8, 0xC9),
-                type_: Rgba8::rgb(0x7F, 0xC9, 0xA6),
+                keyword: Rgba8::rgb(0x7E, 0xB8, 0xD4),
+                function: Rgba8::rgb(0x7E, 0xC4, 0xA8),
+                type_: Rgba8::rgb(0xB8, 0x9E, 0xCC),
                 variable: Rgba8::rgb(0xE6, 0xE4, 0xDC),
-                constant: Rgba8::rgb(0xE0, 0xA6, 0x6B),
-                string: Rgba8::rgb(0x9C, 0xC7, 0x8A),
-                comment: Rgba8::rgb(0x5E, 0x66, 0x75),
-                operator: Rgba8::rgb(0xA6, 0xAB, 0xBA),
+                constant: Rgba8::rgb(0xE0, 0x90, 0x6A),
+                string: Rgba8::rgb(0xC4, 0xA8, 0x6A),
+                comment: Rgba8::rgb(0x4F, 0x5A, 0x72),
+                operator: Rgba8::rgb(0x8A, 0x95, 0xA8),
                 punctuation: Rgba8::rgb(0x8A, 0x8E, 0x9A),
                 attribute: Rgba8::rgb(0xD8, 0xB2, 0x6B),
             },
@@ -243,17 +247,58 @@ impl Theme {
                 tab_active: Rgba8::rgb(0x0E, 0x0E, 0x10),
                 selection: Rgba8::rgba(0xD9, 0xA4, 0x41, 0x26),
             },
+            // design (D2): molten-gold keyword, sage-green string, warm-sand
+            // function, steel type, copper number.
             syntax: Syntax {
-                keyword: Rgba8::rgb(0xD9, 0xA4, 0x41),
-                function: Rgba8::rgb(0xC9, 0xC4, 0xB8),
-                type_: Rgba8::rgb(0xB8, 0xA9, 0x8C),
+                keyword: Rgba8::rgb(0xD4, 0xAA, 0x60),
+                function: Rgba8::rgb(0xC8, 0xA8, 0x82),
+                type_: Rgba8::rgb(0x9A, 0xAB, 0xB8),
                 variable: Rgba8::rgb(0xED, 0xED, 0xEA),
-                constant: Rgba8::rgb(0xD9, 0xA4, 0x41),
-                string: Rgba8::rgb(0x9A, 0xA8, 0x8C),
+                constant: Rgba8::rgb(0xD4, 0x7A, 0x60),
+                string: Rgba8::rgb(0x8F, 0xBF, 0x6A),
                 comment: Rgba8::rgb(0x5C, 0x5C, 0x60),
-                operator: Rgba8::rgb(0x9A, 0x9A, 0x90),
+                operator: Rgba8::rgb(0x5A, 0x5A, 0x62),
                 punctuation: Rgba8::rgb(0x7A, 0x7A, 0x80),
                 attribute: Rgba8::rgb(0xB8, 0x86, 0x2F),
+            },
+        }
+    }
+
+    /// **Eden Nothing** — a Nothing-design tribute: pure black, white text, a
+    /// restrained grayscale syntax ramp punctuated by the signature Nothing red.
+    #[must_use]
+    pub fn eden_nothing() -> Self {
+        // design: Nothing's language is monochrome + a single red (#D71921).
+        // Colour is spent sparingly: red marks the accent, numbers, constants,
+        // and attributes; everything else is a calibrated grey ramp on black.
+        let red = Rgba8::rgb(0xD7, 0x19, 0x21);
+        Self {
+            name: "Eden Nothing".to_owned(),
+            appearance: Appearance::Dark,
+            palette: Palette {
+                background: Rgba8::rgb(0x00, 0x00, 0x00),
+                surface: Rgba8::rgb(0x0A, 0x0A, 0x0A),
+                surface_raised: Rgba8::rgb(0x16, 0x16, 0x16),
+                status_bar: Rgba8::rgb(0x00, 0x00, 0x00),
+                text: Rgba8::rgb(0xF5, 0xF5, 0xF5),
+                text_muted: Rgba8::rgb(0x8A, 0x8A, 0x8A),
+                divider: Rgba8::rgba(0xFF, 0xFF, 0xFF, 0x14),
+                accent: red,
+                accent_soft: Rgba8::rgb(0xE5, 0x48, 0x4D),
+                tab_active: Rgba8::rgb(0x00, 0x00, 0x00),
+                selection: Rgba8::rgba(0xD7, 0x19, 0x21, 0x2E),
+            },
+            syntax: Syntax {
+                keyword: Rgba8::rgb(0xF5, 0xF5, 0xF5),
+                function: Rgba8::rgb(0xCF, 0xCF, 0xCF),
+                type_: Rgba8::rgb(0xB0, 0xB0, 0xB0),
+                variable: Rgba8::rgb(0xE0, 0xE0, 0xE0),
+                constant: red,
+                string: Rgba8::rgb(0x9A, 0x9A, 0x9A),
+                comment: Rgba8::rgb(0x55, 0x55, 0x55),
+                operator: Rgba8::rgb(0x7A, 0x7A, 0x7A),
+                punctuation: Rgba8::rgb(0x6A, 0x6A, 0x6A),
+                attribute: red,
             },
         }
     }
@@ -277,9 +322,30 @@ mod tests {
         let day = Theme::from_toml_str(include_str!("../../../themes/eden-day.toml")).unwrap();
         let dusk = Theme::from_toml_str(include_str!("../../../themes/eden-dusk.toml")).unwrap();
         let noir = Theme::from_toml_str(include_str!("../../../themes/eden-noir.toml")).unwrap();
+        let nothing =
+            Theme::from_toml_str(include_str!("../../../themes/eden-nothing.toml")).unwrap();
         assert_eq!(day, Theme::eden_day());
         assert_eq!(dusk, Theme::eden_dusk());
         assert_eq!(noir, Theme::eden_noir());
+        assert_eq!(nothing, Theme::eden_nothing());
+    }
+
+    /// Regenerates the shipped `themes/*.toml` files from the built-ins. Ignored
+    /// by default; run with `cargo test -p eden-theme regenerate -- --ignored`
+    /// after editing a built-in palette.
+    #[test]
+    #[ignore]
+    fn regenerate_theme_files() {
+        for (theme, file) in [
+            (Theme::eden_day(), "eden-day.toml"),
+            (Theme::eden_dusk(), "eden-dusk.toml"),
+            (Theme::eden_noir(), "eden-noir.toml"),
+            (Theme::eden_nothing(), "eden-nothing.toml"),
+        ] {
+            let toml = theme.to_toml_string().expect("serialise");
+            let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../themes/");
+            std::fs::write(format!("{path}{file}"), toml).expect("write theme");
+        }
     }
 
     #[test]

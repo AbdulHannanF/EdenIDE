@@ -1,5 +1,3 @@
-# Eden Day — warm paper white with a kingfisher-blue accent.
-# Edit and reload; values are #RRGGBB or #RRGGBBAA sRGB.
 name = "Eden Day"
 appearance = "light"
 
@@ -17,13 +15,13 @@ tab_active = "#FBF8F3"
 selection = "#2A6BC824"
 
 [syntax]
-keyword = "#8A4FA0"
-function = "#2A6BC8"
-type_ = "#2E7D6E"
+keyword = "#2A6BC8"
+function = "#1A7A5E"
+type_ = "#7B4CA8"
 variable = "#2A2A30"
-constant = "#B25E2A"
-string = "#3E7D44"
-comment = "#8A857A"
-operator = "#6B6862"
+constant = "#C74C3C"
+string = "#C77B2C"
+comment = "#8A8A8A"
+operator = "#4A4A4F"
 punctuation = "#6B6862"
 attribute = "#9A6B2C"

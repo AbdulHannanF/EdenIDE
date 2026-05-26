@@ -2174,11 +2174,7 @@ impl App {
         {
             let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
             let theme_names: Vec<&str> = (0..chrome.theme_count())
-                .map(|i| {
-                    // We can't call a per-index name getter easily; use the active name
-                    // and a placeholder for others. The cycle gesture changes the theme.
-                    if i == 0 { "Eden Day" } else if i == 1 { "Eden Dusk" } else { "Eden Noir" }
-                })
+                .map(|i| chrome.theme_name(i).unwrap_or("—"))
                 .collect();
             let toggles = [
                 SettingsToggle { label: "Minimap", enabled: self.minimap_open },

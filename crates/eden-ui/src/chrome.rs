@@ -197,6 +197,12 @@ impl Chrome {
         &self.themes[self.active_theme].name
     }
 
+    /// The name of the theme at `index`, or `None` if out of range.
+    #[must_use]
+    pub fn theme_name(&self, index: usize) -> Option<&str> {
+        self.themes.get(index).map(|t| t.name.as_str())
+    }
+
     /// The index of the currently active theme.
     #[must_use]
     pub fn active_theme_index(&self) -> usize {

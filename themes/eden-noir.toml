@@ -1,4 +1,3 @@
-# Eden Noir — near-black, high contrast, a single molten-gold accent.
 name = "Eden Noir"
 appearance = "dark"
 
@@ -16,13 +15,13 @@ tab_active = "#0E0E10"
 selection = "#D9A44126"
 
 [syntax]
-keyword = "#D9A441"
-function = "#C9C4B8"
-type_ = "#B8A98C"
+keyword = "#D4AA60"
+function = "#C8A882"
+type_ = "#9AABB8"
 variable = "#EDEDEA"
-constant = "#D9A441"
-string = "#9AA88C"
+constant = "#D47A60"
+string = "#8FBF6A"
 comment = "#5C5C60"
-operator = "#9A9A90"
+operator = "#5A5A62"
 punctuation = "#7A7A80"
 attribute = "#B8862F"
