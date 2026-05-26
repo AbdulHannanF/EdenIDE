@@ -13,7 +13,7 @@ use cosmic_text::{Attrs, Buffer as CtBuffer, Family, FontSystem, Metrics, Shapin
 use eden_editor::Editor;
 use eden_syntax::{HighlightKind, Highlights};
 use eden_theme::{Palette, Rgba8, Syntax};
-use vello::kurbo::{Affine, Rect};
+use vello::kurbo::{Affine, Point, Rect};
 use vello::peniko::{Blob, Fill, FontData};
 use vello::{Glyph, Scene};
 
@@ -27,16 +27,22 @@ const LINE_HEIGHT_FACTOR: f64 = 1.55;
 // Windows. Family resolution is the only thing that needs to change.
 const EDITOR_FAMILY: Family<'static> = Family::Name("Consolas");
 
-fn with_alpha(color: Rgba8, alpha: u8) -> Rgba8 {
-    Rgba8::rgba(color.r, color.g, color.b, alpha)
+// design: diagnostic mark colours matching §5 Ambient Compile (rose / amber).
+const MARK_ERROR: Rgba8 = Rgba8::rgb(0xE5, 0x53, 0x4B);
+const MARK_WARN: Rgba8 = Rgba8::rgb(0xC7, 0x7B, 0x2C);
+
+// ── gutter mark ───────────────────────────────────────────────────────────────
+
+/// A diagnostic severity marker drawn in the editor gutter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GutterMark {
+    /// A hard error.
+    Error,
+    /// A warning.
+    Warning,
 }
 
-fn shape_buffer(buf: &mut CtBuffer, fs: &mut FontSystem, text: &str, width: Option<f32>, height: f32) {
-    let attrs = Attrs::new().family(EDITOR_FAMILY);
-    buf.set_text(text, &attrs, Shaping::Advanced, None);
-    buf.set_size(width, Some(height));
-    buf.shape_until_scroll(fs, false);
-}
+// ── view types ────────────────────────────────────────────────────────────────
 
 /// Everything [`TextSystem::paint_editor`] needs for one frame.
 pub struct EditorFrame<'a> {
@@ -56,6 +62,8 @@ pub struct EditorFrame<'a> {
     pub scale: f64,
     /// Whether to draw carets (typically: window focused).
     pub show_caret: bool,
+    /// Gutter markers, as `(zero-indexed line, mark)` pairs.
+    pub gutter_marks: &'a [(u32, GutterMark)],
 }
 
 /// One row of the sidebar file tree to render.
@@ -89,6 +97,26 @@ pub struct PaletteView<'a> {
     /// The index of the highlighted row.
     pub selected: usize,
 }
+
+/// A single item in the completion popup.
+pub struct CompletionEntry {
+    /// Display label.
+    pub label: String,
+    /// Optional secondary detail (type/module).
+    pub detail: Option<String>,
+}
+
+/// The completion popup to render.
+pub struct CompletionView<'a> {
+    /// Items to show (already filtered, best-first).
+    pub entries: &'a [CompletionEntry],
+    /// Index of the currently highlighted item.
+    pub selected: usize,
+    /// Physical-pixel anchor point (top-left of the caret).
+    pub anchor: Point,
+}
+
+// ── TextSystem ────────────────────────────────────────────────────────────────
 
 /// Owns the font system and shaping buffers, and draws editor content.
 pub struct TextSystem {
@@ -131,6 +159,19 @@ impl TextSystem {
         self.line_h
     }
 
+    /// The glyph advance (character width) in physical pixels.
+    #[must_use]
+    pub fn advance(&self) -> f64 {
+        self.advance
+    }
+
+    /// The gutter width for a buffer with `total_lines` lines, in physical px.
+    #[must_use]
+    pub fn gutter_width(&self, total_lines: usize) -> f64 {
+        let digits = total_lines.max(1).to_string().len();
+        self.advance * digits as f64 + 28.0 * self.scale
+    }
+
     fn metrics_for(scale: f64) -> (f64, f64) {
         let font_size_px = FONT_SIZE * scale;
         (font_size_px, font_size_px * LINE_HEIGHT_FACTOR)
@@ -151,7 +192,13 @@ impl TextSystem {
     }
 
     fn measure_advance(&mut self) {
-        shape_buffer(&mut self.aux_buf, &mut self.font_system, "0000000000", None, self.line_h as f32);
+        shape_buffer(
+            &mut self.aux_buf,
+            &mut self.font_system,
+            "0000000000",
+            None,
+            self.line_h as f32,
+        );
         let width = self
             .aux_buf
             .layout_runs()
@@ -175,11 +222,13 @@ impl TextSystem {
         Some(data)
     }
 
+    // ── editor ────────────────────────────────────────────────────────────
+
     /// Paints the editor's gutter, text, selections, and carets into `area`.
     ///
     /// `scroll_px` is the vertical scroll offset in physical pixels; it is
-    /// clamped to the content height here and the clamped value returned, so the
-    /// caller can keep its scroll spring in range.
+    /// clamped to the content height here and the clamped value returned, so
+    /// the caller can keep its scroll spring in range.
     pub fn paint_editor(&mut self, scene: &mut Scene, frame: &EditorFrame<'_>) -> f64 {
         let EditorFrame {
             area,
@@ -190,6 +239,7 @@ impl TextSystem {
             scroll_px,
             scale,
             show_caret,
+            gutter_marks,
         } = *frame;
         self.ensure_metrics(scale);
         let buffer = editor.buffer();
@@ -216,6 +266,28 @@ impl TextSystem {
 
         let row_top = |line: usize| area.y0 - frac + (line - first_line) as f64 * line_h;
 
+        // Gutter marks (diagnostic dots at far-left of gutter).
+        let mark_sz = 5.0 * scale;
+        let mark_x = area.x0 + 4.0 * scale;
+        for &(mark_line, mark) in gutter_marks.iter() {
+            let ml = mark_line as usize;
+            if ml < first_line || ml >= last_line {
+                continue;
+            }
+            let y = row_top(ml);
+            let my = y + (line_h - mark_sz) / 2.0;
+            let color = match mark {
+                GutterMark::Error => MARK_ERROR,
+                GutterMark::Warning => MARK_WARN,
+            };
+            fill_rrect(
+                scene,
+                Rect::new(mark_x, my, mark_x + mark_sz, my + mark_sz),
+                mark_sz / 2.0,
+                color,
+            );
+        }
+
         // Selection highlights, behind the text.
         for sel in editor.selections() {
             if sel.is_empty() {
@@ -231,12 +303,16 @@ impl TextSystem {
                 let col1 = if buffer.char_to_line(end) == line {
                     end - line_start
                 } else {
-                    line_len + 1 // run the highlight through the wrapped newline
+                    line_len + 1
                 };
                 let y = row_top(line);
                 let x0 = text_x + col0 as f64 * advance;
                 let x1 = text_x + col1 as f64 * advance;
-                fill_rect(scene, Rect::new(x0, y, x1.max(x0 + 2.0), y + line_h), palette.selection);
+                fill_rect(
+                    scene,
+                    Rect::new(x0, y, x1.max(x0 + 2.0), y + line_h),
+                    palette.selection,
+                );
             }
         }
 
@@ -253,9 +329,6 @@ impl TextSystem {
         );
         let rope = buffer.rope();
         let total_chars = buffer.len_chars();
-        // Colour each glyph by the highlight kind at its character. Monospace, so
-        // the glyph index within a run equals the column (good enough for code;
-        // tabs/grapheme clusters are a known approximation).
         let runs: Vec<RunData> = self
             .text_buf
             .layout_runs()
@@ -334,8 +407,10 @@ impl TextSystem {
         scroll
     }
 
-    /// Paints the sidebar file tree into `area` with virtual scrolling (only
-    /// the visible rows are drawn). Returns the clamped scroll offset.
+    // ── sidebar file tree ─────────────────────────────────────────────────
+
+    /// Paints the sidebar file tree into `area` with virtual scrolling.
+    /// Returns the clamped scroll offset.
     pub fn paint_file_tree(
         &mut self,
         scene: &mut Scene,
@@ -363,7 +438,11 @@ impl TextSystem {
         for (i, row) in rows.iter().enumerate().take(last).skip(first) {
             let top = area.y0 - frac + (i - first) as f64 * row_h;
             if hovered == Some(i) {
-                fill_rect(scene, Rect::new(area.x0, top, area.x1, top + row_h), with_alpha(palette.accent, 0x16));
+                fill_rect(
+                    scene,
+                    Rect::new(area.x0, top, area.x1, top + row_h),
+                    with_alpha(palette.accent, 0x16),
+                );
             }
             let indent = area.x0 + 10.0 * scale + row.depth as f64 * 14.0 * scale;
             let marker = 7.0 * scale;
@@ -374,13 +453,23 @@ impl TextSystem {
                 } else {
                     with_alpha(palette.text_muted, 0xC0)
                 };
-                fill_rrect(scene, Rect::new(indent, my, indent + marker, my + marker), 2.0 * scale, color);
+                fill_rrect(
+                    scene,
+                    Rect::new(indent, my, indent + marker, my + marker),
+                    2.0 * scale,
+                    color,
+                );
             } else {
                 let dot = marker * 0.55;
                 let dy = top + row_h * 0.5 - dot / 2.0;
                 fill_rrect(
                     scene,
-                    Rect::new(indent + (marker - dot) / 2.0, dy, indent + (marker + dot) / 2.0, dy + dot),
+                    Rect::new(
+                        indent + (marker - dot) / 2.0,
+                        dy,
+                        indent + (marker + dot) / 2.0,
+                        dy + dot,
+                    ),
                     dot / 2.0,
                     with_alpha(palette.text_muted, 0x80),
                 );
@@ -399,21 +488,7 @@ impl TextSystem {
         scroll
     }
 
-    /// Draws a single line of UI text with its baseline at `baseline`.
-    pub fn draw_text(&mut self, scene: &mut Scene, text: &str, x: f64, baseline: f64, color: Rgba8) {
-        shape_buffer(&mut self.aux_buf, &mut self.font_system, text, None, self.line_h as f32);
-        let runs: Vec<RunData> = self
-            .aux_buf
-            .layout_runs()
-            .map(|run| RunData {
-                line_y: run.line_y,
-                glyphs: run.glyphs.iter().map(|g| GlyphData::new(g, color)).collect(),
-            })
-            .collect();
-        for run in &runs {
-            self.draw_glyphs(scene, &run.glyphs, x, baseline);
-        }
-    }
+    // ── command palette ───────────────────────────────────────────────────
 
     /// Paints the Cmd-P style command palette as a floating overlay over
     /// `screen`. Returns the number of result rows actually drawn.
@@ -426,7 +501,6 @@ impl TextSystem {
         scale: f64,
     ) -> usize {
         self.ensure_metrics(scale);
-        // Scrim to push the editor back.
         fill_rect(scene, screen, Rgba8::rgba(0, 0, 0, 0x4D));
 
         let row_h = 30.0 * scale;
@@ -444,7 +518,6 @@ impl TextSystem {
         fill_rrect(scene, panel, 12.0 * scale, palette.surface_raised);
 
         let pad = 18.0 * scale;
-        // Query line.
         let query_baseline = y0 + query_h * 0.64;
         let prompt = if view.query.is_empty() {
             "Open file…".to_string()
@@ -457,15 +530,21 @@ impl TextSystem {
             palette.text
         };
         self.draw_text(scene, &prompt, x0 + pad, query_baseline, prompt_color);
-        // Divider under the query.
-        let div = (scale).max(1.0);
-        fill_rect(scene, Rect::new(x0, y0 + query_h, x0 + width, y0 + query_h + div), palette.divider);
+        let div = scale.max(1.0);
+        fill_rect(
+            scene,
+            Rect::new(x0, y0 + query_h, x0 + width, y0 + query_h + div),
+            palette.divider,
+        );
 
-        // Result rows.
         for (i, entry) in view.entries.iter().take(shown).enumerate() {
             let row_top = y0 + query_h + i as f64 * row_h;
             if i == view.selected {
-                fill_rect(scene, Rect::new(x0, row_top, x0 + width, row_top + row_h), palette.selection);
+                fill_rect(
+                    scene,
+                    Rect::new(x0, row_top, x0 + width, row_top + row_h),
+                    palette.selection,
+                );
             }
             let color = if i == view.selected {
                 palette.text
@@ -479,8 +558,141 @@ impl TextSystem {
         shown
     }
 
-    fn draw_glyphs(&mut self, scene: &mut Scene, glyphs: &[GlyphData], origin_x: f64, baseline: f64) {
-        // Batch consecutive glyphs that share both font and colour into one run.
+    // ── hover card ────────────────────────────────────────────────────────
+
+    /// Paints a floating hover tooltip anchored to `anchor` (physical-pixel
+    /// top of the hovered line).
+    pub fn paint_hover_card(
+        &mut self,
+        scene: &mut Scene,
+        screen: Rect,
+        anchor: Point,
+        content: &str,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        // Keep to first 6 non-empty lines; strip markdown fence delimiters.
+        let lines: Vec<&str> = content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("```"))
+            .take(6)
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+
+        let pad = 10.0 * scale;
+        let row_h = self.line_h;
+        let width = (screen.width() * 0.5).clamp(220.0 * scale, 560.0 * scale);
+        let height = lines.len() as f64 * row_h + pad * 2.0;
+
+        // Position above the anchor if space allows, otherwise below.
+        let y_above = anchor.y - height - 4.0 * scale;
+        let y_below = anchor.y + self.line_h + 4.0 * scale;
+        let y0 = if y_above >= screen.y0 { y_above } else { y_below };
+        let x0 = anchor.x.clamp(screen.x0 + 8.0 * scale, screen.x1 - width - 8.0 * scale);
+        let card = Rect::new(x0, y0, x0 + width, y0 + height);
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &card);
+        fill_rrect(scene, card, 8.0 * scale, palette.surface_raised);
+
+        for (i, line) in lines.iter().enumerate() {
+            // Clip very long lines visually.
+            let display = if line.len() > 100 { &line[..100] } else { line };
+            let baseline = y0 + pad + (i as f64 + 0.72) * row_h;
+            self.draw_text(scene, display, x0 + pad, baseline, palette.text);
+        }
+
+        scene.pop_layer();
+    }
+
+    // ── completion popup ──────────────────────────────────────────────────
+
+    /// Paints the completion popup below (or above) the caret.
+    pub fn paint_completion(
+        &mut self,
+        scene: &mut Scene,
+        screen: Rect,
+        view: &CompletionView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        if view.entries.is_empty() {
+            return;
+        }
+        self.ensure_metrics(scale);
+
+        let shown = view.entries.len().min(8);
+        let row_h = 26.0 * scale;
+        let pad_x = 12.0 * scale;
+        let width = (screen.width() * 0.35).clamp(200.0 * scale, 440.0 * scale);
+        let height = shown as f64 * row_h + 6.0 * scale;
+
+        // Prefer below the caret; flip up if near the bottom.
+        let y_below = view.anchor.y + self.line_h + 2.0 * scale;
+        let y_above = view.anchor.y - height - 2.0 * scale;
+        let y0 = if y_below + height <= screen.y1 { y_below } else { y_above };
+        let x0 = view.anchor.x.clamp(screen.x0, screen.x1 - width);
+        let panel = Rect::new(x0, y0, x0 + width, y0 + height);
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &panel);
+        fill_rrect(scene, panel, 8.0 * scale, palette.surface_raised);
+
+        for (i, entry) in view.entries.iter().take(shown).enumerate() {
+            let row_top = y0 + 3.0 * scale + i as f64 * row_h;
+            if i == view.selected {
+                fill_rect(
+                    scene,
+                    Rect::new(x0, row_top, x0 + width, row_top + row_h),
+                    palette.selection,
+                );
+            }
+            let label_color = if i == view.selected {
+                palette.text
+            } else {
+                with_alpha(palette.text, 0xCC)
+            };
+            self.draw_text(scene, &entry.label, x0 + pad_x, row_top + row_h * 0.7, label_color);
+            if let Some(ref detail) = entry.detail {
+                let detail_color = with_alpha(palette.text_muted, 0xA0);
+                // Right-align detail inside the panel.
+                let detail_x = x0 + width - pad_x - detail.len() as f64 * self.advance * 0.6;
+                if detail_x > x0 + width * 0.5 {
+                    self.draw_text(scene, detail, detail_x, row_top + row_h * 0.7, detail_color);
+                }
+            }
+        }
+
+        scene.pop_layer();
+    }
+
+    // ── shared drawing helpers ────────────────────────────────────────────
+
+    /// Draws a single line of UI text with its baseline at `baseline`.
+    pub fn draw_text(&mut self, scene: &mut Scene, text: &str, x: f64, baseline: f64, color: Rgba8) {
+        shape_buffer(&mut self.aux_buf, &mut self.font_system, text, None, self.line_h as f32);
+        let runs: Vec<RunData> = self
+            .aux_buf
+            .layout_runs()
+            .map(|run| RunData {
+                line_y: run.line_y,
+                glyphs: run.glyphs.iter().map(|g| GlyphData::new(g, color)).collect(),
+            })
+            .collect();
+        for run in &runs {
+            self.draw_glyphs(scene, &run.glyphs, x, baseline);
+        }
+    }
+
+    fn draw_glyphs(
+        &mut self,
+        scene: &mut Scene,
+        glyphs: &[GlyphData],
+        origin_x: f64,
+        baseline: f64,
+    ) {
         let mut i = 0;
         while i < glyphs.len() {
             let font_id = glyphs[i].font_id;
@@ -510,6 +722,25 @@ impl TextSystem {
     }
 }
 
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+fn with_alpha(color: Rgba8, alpha: u8) -> Rgba8 {
+    Rgba8::rgba(color.r, color.g, color.b, alpha)
+}
+
+fn shape_buffer(
+    buf: &mut CtBuffer,
+    fs: &mut FontSystem,
+    text: &str,
+    width: Option<f32>,
+    height: f32,
+) {
+    let attrs = Attrs::new().family(EDITOR_FAMILY);
+    buf.set_text(text, &attrs, Shaping::Advanced, None);
+    buf.set_size(width, Some(height));
+    buf.shape_until_scroll(fs, false);
+}
+
 /// Maps a tree-sitter highlight kind to a theme syntax colour.
 fn syntax_color(syntax: &Syntax, kind: HighlightKind, default: Rgba8) -> Rgba8 {
     match kind {
@@ -527,9 +758,11 @@ fn syntax_color(syntax: &Syntax, kind: HighlightKind, default: Rgba8) -> Rgba8 {
     }
 }
 
-/// A copy of the per-glyph data we need, decoupled from cosmic-text's borrow so
-/// we can shape into `text_buf` and then draw without holding an immutable
-/// borrow of `self` across the mutable `font_for` calls.
+// ── per-glyph data ────────────────────────────────────────────────────────────
+
+/// Per-glyph data decoupled from cosmic-text's borrow so we can shape into
+/// `text_buf` and then draw without holding an immutable borrow across the
+/// mutable `font_for` calls.
 struct GlyphData {
     font_id: fontdb::ID,
     glyph_id: u16,

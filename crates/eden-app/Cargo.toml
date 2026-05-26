@@ -16,6 +16,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+eden-lsp.workspace = true
 eden-motion.workspace = true
 eden-search.workspace = true
 eden-ui.workspace = true
