@@ -3366,16 +3366,15 @@ impl ApplicationHandler for App {
         if self.text.is_none() {
             self.text = Some(TextSystem::new(self.scale));
         }
-        // Open startup file on first launch — prefer crates/eden-app/src/main.rs
-        // relative to the workspace root; fall back to empty welcome buffer.
-        if self.current_path.is_none() {
-            let startup = self.project.root()
-                .join("crates")
-                .join("eden-app")
-                .join("src")
-                .join("main.rs");
-            if startup.exists() {
-                self.open_path(&startup);
+        // Open a file passed on the command line (`eden path/to/file`); a bare
+        // directory arg is handled as the project root, so only open files here.
+        // With no file argument we keep the empty welcome buffer.
+        if self.current_path.is_none()
+            && let Some(arg) = std::env::args().nth(1)
+        {
+            let p = PathBuf::from(&arg);
+            if p.is_file() {
+                self.open_path(&p);
             }
         }
         self.last_frame = Instant::now();
