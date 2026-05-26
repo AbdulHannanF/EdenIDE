@@ -402,6 +402,30 @@ impl TextSystem {
             }
         }
 
+        // Ambient Compile: multi-pass bloom behind error/warning lines so
+        // diagnostics create a soft glow rather than just a gutter dot.
+        for &(mark_line, mark) in gutter_marks.iter() {
+            let ml = mark_line as usize;
+            if ml < first_line || ml >= last_line {
+                continue;
+            }
+            let y = row_top(ml);
+            let (r, g, b) = match mark {
+                GutterMark::Error => (MARK_ERROR.r, MARK_ERROR.g, MARK_ERROR.b),
+                GutterMark::Warning => (MARK_WARN.r, MARK_WARN.g, MARK_WARN.b),
+            };
+            // Three passes — progressively wider and more transparent.
+            for pass in 0u32..3 {
+                let expand = pass as f64 * 5.0 * scale;
+                let alpha = 0x28u8.saturating_sub(pass as u8 * 0x0C);
+                fill_rect(
+                    scene,
+                    Rect::new(text_x, y - expand, area.x1, y + line_h + expand),
+                    Rgba8::rgba(r, g, b, alpha),
+                );
+            }
+        }
+
         // Selection highlights, behind the text.
         for sel in editor.selections() {
             if sel.is_empty() {
@@ -973,6 +997,135 @@ impl TextSystem {
         scene.pop_layer();
     }
 
+    // ── semantic minimap ──────────────────────────────────────────────────
+
+    /// Paints a semantic minimap overlay on the right edge of `editor_rect`.
+    ///
+    /// Each document line is rendered as a 1-3 px stripe coloured by its
+    /// dominant syntax kind. A translucent band shows the current viewport.
+    pub fn paint_minimap(
+        &mut self,
+        scene: &mut Scene,
+        editor_rect: Rect,
+        view: &MinimapView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        let map_w = 72.0 * scale;
+        let map_x0 = editor_rect.x1 - map_w;
+        let map_rect = Rect::new(map_x0, editor_rect.y0, editor_rect.x1, editor_rect.y1);
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &map_rect);
+        fill_rect(scene, map_rect, with_alpha(palette.surface, 0xD8));
+
+        let buffer = view.editor.buffer();
+        let total_lines = buffer.len_lines().max(1);
+        let map_h = map_rect.height();
+        let px_per_line = (map_h / total_lines as f64).max(0.5);
+        let stripe_h = px_per_line.min(3.0 * scale).max(1.0);
+        let rope = buffer.rope();
+
+        for line in 0..total_lines {
+            let line_y = map_rect.y0 + line as f64 * px_per_line;
+            if line_y > map_rect.y1 {
+                break;
+            }
+            let char_start = buffer.line_to_char(line);
+            let byte_start = rope.char_to_byte(char_start);
+            let kind = view.highlights.kind_at(byte_start);
+            let color = match kind {
+                HighlightKind::Keyword | HighlightKind::Label => with_alpha(view.syntax.keyword, 0x88),
+                HighlightKind::Function => with_alpha(view.syntax.function, 0x88),
+                HighlightKind::Type | HighlightKind::Constructor => with_alpha(view.syntax.type_, 0x88),
+                HighlightKind::String | HighlightKind::Escape => with_alpha(view.syntax.string, 0x80),
+                HighlightKind::Comment => with_alpha(view.syntax.comment, 0x70),
+                HighlightKind::Attribute => with_alpha(view.syntax.attribute, 0x80),
+                _ => with_alpha(palette.text_muted, 0x38),
+            };
+            let len_frac = (buffer.line_len(line).min(80) as f64 / 80.0).max(0.05);
+            let stripe_w = len_frac * (map_w - 8.0 * scale);
+            fill_rect(
+                scene,
+                Rect::new(map_x0 + 4.0 * scale, line_y, map_x0 + 4.0 * scale + stripe_w, line_y + stripe_h),
+                color,
+            );
+        }
+
+        // Viewport indicator: translucent accent band + left border.
+        let vis_start = view.scroll_px / self.line_h;
+        let vis_lines = (editor_rect.height() / self.line_h).ceil();
+        let vp_y0 = (map_rect.y0 + vis_start * px_per_line).min(map_rect.y1);
+        let vp_h = (vis_lines * px_per_line).max(4.0);
+        let vp_y1 = (vp_y0 + vp_h).min(map_rect.y1);
+        fill_rect(scene, Rect::new(map_x0, vp_y0, map_rect.x1, vp_y1), with_alpha(palette.accent, 0x1C));
+        fill_rect(scene, Rect::new(map_x0, vp_y0, map_x0 + 2.0 * scale, vp_y1), with_alpha(palette.accent, 0x60));
+
+        scene.pop_layer();
+    }
+
+    // ── time scrubber ─────────────────────────────────────────────────────
+
+    /// Paints a horizontal time-scrubber bar at the bottom-right of
+    /// `editor_rect` and returns the bar's rect for click-detection.
+    ///
+    /// Returns `None` when `view.total == 0` (nothing to scrub).
+    pub fn paint_time_scrubber(
+        &mut self,
+        scene: &mut Scene,
+        editor_rect: Rect,
+        view: &ScrubberView,
+        palette: &Palette,
+        scale: f64,
+    ) -> Option<Rect> {
+        if view.total == 0 {
+            return None;
+        }
+        self.ensure_metrics(scale);
+        let bar_w = 180.0 * scale;
+        let bar_h = 22.0 * scale;
+        let pad = 12.0 * scale;
+        let x0 = editor_rect.x1 - bar_w - pad;
+        let y0 = editor_rect.y1 - bar_h - pad;
+        let bar = Rect::new(x0, y0, x0 + bar_w, y0 + bar_h);
+
+        fill_rrect(scene, bar, 4.0 * scale, with_alpha(palette.surface_raised, 0xCC));
+
+        // Filled portion = fraction of history used.
+        let frac = view.undo_pos as f64 / view.total as f64;
+        if frac > 0.0 {
+            let fill_w = frac * bar_w;
+            fill_rrect(
+                scene,
+                Rect::new(x0, y0, x0 + fill_w, y0 + bar_h),
+                4.0 * scale,
+                with_alpha(palette.accent, 0xA0),
+            );
+        }
+
+        // Thumb marker.
+        let thumb_cx = x0 + frac * bar_w;
+        let thumb_r = bar_h / 2.0 - scale;
+        fill_rrect(
+            scene,
+            Rect::new(thumb_cx - thumb_r, y0 + scale, thumb_cx + thumb_r, y0 + bar_h - scale),
+            thumb_r,
+            palette.accent,
+        );
+
+        // Step label inside the bar.
+        let label = format!("{} / {}", view.undo_pos, view.total);
+        self.draw_text(
+            scene,
+            &label,
+            x0 + 6.0 * scale,
+            y0 + bar_h * 0.72,
+            with_alpha(palette.text_muted, 0xCC),
+        );
+
+        Some(bar)
+    }
+
     // ── shared drawing helpers ────────────────────────────────────────────
 
     /// Draws a single line of UI text with its baseline at `baseline`.
@@ -1061,6 +1214,30 @@ fn syntax_color(syntax: &Syntax, kind: HighlightKind, default: Rgba8) -> Rgba8 {
         HighlightKind::Attribute => syntax.attribute,
         HighlightKind::Default => default,
     }
+}
+
+// ── minimap ───────────────────────────────────────────────────────────────────
+
+/// Everything needed to render the semantic minimap for one frame.
+pub struct MinimapView<'a> {
+    /// The editor model.
+    pub editor: &'a Editor,
+    /// Highlight spans for the whole document.
+    pub highlights: &'a Highlights,
+    /// Syntax colour set (interpolated mid-crossfade).
+    pub syntax: &'a eden_theme::Syntax,
+    /// Current vertical scroll in physical pixels.
+    pub scroll_px: f64,
+}
+
+// ── scrubber ──────────────────────────────────────────────────────────────────
+
+/// Everything needed to render the time scrubber widget.
+pub struct ScrubberView {
+    /// Number of undo steps available (position in history).
+    pub undo_pos: usize,
+    /// Total history depth (undo + redo steps).
+    pub total: usize,
 }
 
 // ── per-glyph data ────────────────────────────────────────────────────────────

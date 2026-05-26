@@ -20,6 +20,7 @@ eden-lsp.workspace = true
 eden-motion.workspace = true
 eden-search.workspace = true
 eden-terminal.workspace = true
+eden-theme.workspace = true
 eden-ui.workspace = true
 eden-vcs.workspace = true
 eden-workspace.workspace = true

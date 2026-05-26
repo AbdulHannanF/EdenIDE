@@ -1,14 +1,17 @@
 //! Eden — the application binary.
 //!
-//! Phase 5 ("Surroundings"): project-wide content search, command palette,
-//! embedded terminal, and git gutter diff markers.
+//! Phase 6 ("Signature Features"):
+//!   Ambient Compile    — soft bloom behind diagnostic lines
+//!   Focus Halo         — sidebar/tab dim while typing, breathe back on hover
+//!   Whisper Palette    — NL intent strings for Ctrl+Shift+P commands
+//!   Time Scrubber      — horizontal undo-history bar (Ctrl+Shift+H)
+//!   Semantic Minimap   — syntax-coloured minimap overlay (Ctrl+M)
+//!   Choreographed Diff — ghost caret on large jumps + go-to-def navigation
 //!
-//! Controls:
-//!   Ctrl+B — toggle sidebar         Ctrl+T — cycle theme
-//!   Ctrl+Z / Ctrl+Y — undo / redo   Ctrl+A — select all
-//!   Ctrl+P — Cmd-P fuzzy file open  Ctrl+Space — completions
-//!   Ctrl+Shift+F — project search   Ctrl+Shift+P — command palette
-//!   Ctrl+\` — toggle terminal       F12 — go-to-definition
+//! All earlier controls still apply; additions:
+//!   Ctrl+M             — toggle semantic minimap
+//!   Ctrl+Shift+H       — toggle time scrubber
+//!   F12                — go to definition (now navigates)
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,10 +23,12 @@ use eden_lsp::{CompletionItem, LspPool, Position as LspPos, Severity};
 use eden_motion::{MotionPrefs, Spring, SpringConfig};
 use eden_search::{FuzzyMatcher, SearchHit, SearchQuery, search_project};
 use eden_terminal::TerminalBackend;
+use eden_theme::Rgba8;
 use eden_ui::{
     Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
-    EditorFrame, GutterMark, Highlighter, Highlights, PaletteView, SearchPanelView, SearchRowView,
-    TerminalView, TextSystem, TreeRow, TreeView,
+    EditorFrame, GutterMark, Highlighter, Highlights, MinimapView, PaletteView, SearchPanelView,
+    SearchRowView, ScrubberView, TerminalView, TextSystem, TreeRow, TreeView,
+    fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -44,12 +49,14 @@ const CLEAR: Color = Color::from_rgb8(0xFB, 0xF8, 0xF3);
 /// Cursor must be still for this long before a hover request is fired.
 const HOVER_DELAY: Duration = Duration::from_millis(400);
 
-const SAMPLE: &str = "// Eden — Phase 5: Surroundings.\n\
+const SAMPLE: &str = "// Eden — Phase 6: Signature Features.\n\
 //\n\
-// Ctrl+Shift+F  project search\n\
-// Ctrl+Shift+P  command palette\n\
-// Ctrl+`        toggle terminal\n\
-// Git diff markers appear in the gutter when a file is opened from git repo.\n\
+// Ctrl+M             toggle semantic minimap\n\
+// Ctrl+Shift+H       toggle time scrubber\n\
+// Ctrl+Shift+P       command palette (try typing \"show files\" or \"undo\")\n\
+// Ambient Compile    bloom behind diagnostic lines when rust-analyzer is running\n\
+// Focus Halo         sidebar dims while you type, breathes back on hover\n\
+// Choreographed Diff ghost caret appears when F12 jumps to a definition\n\
 \n\
 fn main() {\n\
     let greeting = \"hello, eden\";\n\
@@ -88,27 +95,99 @@ enum CommandId {
     SelectAll,
     GoToDefinition,
     TriggerCompletions,
+    ToggleMinimap,
+    ToggleTimeScrubber,
 }
 
 struct Command {
     id: CommandId,
     label: &'static str,
     shortcut: Option<&'static str>,
+    /// Natural-language intent phrases used by the Whisper Palette for NL
+    /// matching when the label itself does not match the query.
+    intent: &'static [&'static str],
 }
 
 fn built_in_commands() -> Vec<Command> {
     vec![
-        Command { id: CommandId::ToggleSidebar,      label: "Toggle Sidebar",         shortcut: Some("Ctrl+B") },
-        Command { id: CommandId::CycleTheme,          label: "Cycle Theme",             shortcut: Some("Ctrl+T") },
-        Command { id: CommandId::OpenFilePalette,     label: "Open File…",              shortcut: Some("Ctrl+P") },
-        Command { id: CommandId::ProjectSearch,       label: "Project Search",          shortcut: Some("Ctrl+Shift+F") },
-        Command { id: CommandId::ToggleTerminal,      label: "Toggle Terminal",         shortcut: Some("Ctrl+`") },
-        Command { id: CommandId::Undo,                label: "Undo",                    shortcut: Some("Ctrl+Z") },
-        Command { id: CommandId::Redo,                label: "Redo",                    shortcut: Some("Ctrl+Y") },
-        Command { id: CommandId::SelectAll,           label: "Select All",              shortcut: Some("Ctrl+A") },
-        Command { id: CommandId::GoToDefinition,      label: "Go to Definition",        shortcut: Some("F12") },
-        Command { id: CommandId::TriggerCompletions,  label: "Trigger Completions",     shortcut: Some("Ctrl+Space") },
-        Command { id: CommandId::CommandPalette,      label: "Open Command Palette",    shortcut: Some("Ctrl+Shift+P") },
+        Command {
+            id: CommandId::ToggleSidebar,
+            label: "Toggle Sidebar",
+            shortcut: Some("Ctrl+B"),
+            intent: &["show sidebar", "hide sidebar", "file tree", "explorer", "files panel"],
+        },
+        Command {
+            id: CommandId::CycleTheme,
+            label: "Cycle Theme",
+            shortcut: Some("Ctrl+T"),
+            intent: &["change theme", "switch theme", "dark mode", "light mode", "color scheme"],
+        },
+        Command {
+            id: CommandId::OpenFilePalette,
+            label: "Open File…",
+            shortcut: Some("Ctrl+P"),
+            intent: &["open file", "find file", "go to file", "switch file", "quick open"],
+        },
+        Command {
+            id: CommandId::ProjectSearch,
+            label: "Project Search",
+            shortcut: Some("Ctrl+Shift+F"),
+            intent: &["search project", "find in files", "grep", "search codebase", "look for text"],
+        },
+        Command {
+            id: CommandId::ToggleTerminal,
+            label: "Toggle Terminal",
+            shortcut: Some("Ctrl+`"),
+            intent: &["open terminal", "show terminal", "hide terminal", "shell", "console"],
+        },
+        Command {
+            id: CommandId::Undo,
+            label: "Undo",
+            shortcut: Some("Ctrl+Z"),
+            intent: &["revert", "go back", "previous state", "undo last change"],
+        },
+        Command {
+            id: CommandId::Redo,
+            label: "Redo",
+            shortcut: Some("Ctrl+Y"),
+            intent: &["redo", "forward", "next state", "redo last change"],
+        },
+        Command {
+            id: CommandId::SelectAll,
+            label: "Select All",
+            shortcut: Some("Ctrl+A"),
+            intent: &["select everything", "highlight all", "mark all"],
+        },
+        Command {
+            id: CommandId::GoToDefinition,
+            label: "Go to Definition",
+            shortcut: Some("F12"),
+            intent: &["go to definition", "jump to definition", "find definition", "navigate to source"],
+        },
+        Command {
+            id: CommandId::TriggerCompletions,
+            label: "Trigger Completions",
+            shortcut: Some("Ctrl+Space"),
+            intent: &["autocomplete", "show suggestions", "intellisense", "complete code"],
+        },
+        Command {
+            id: CommandId::CommandPalette,
+            label: "Open Command Palette",
+            shortcut: Some("Ctrl+Shift+P"),
+            intent: &["command palette", "run command", "open palette"],
+        },
+        Command {
+            id: CommandId::ToggleMinimap,
+            label: "Toggle Minimap",
+            shortcut: Some("Ctrl+M"),
+            intent: &["show minimap", "hide minimap", "code overview", "semantic minimap"],
+        },
+        Command {
+            id: CommandId::ToggleTimeScrubber,
+            label: "Toggle Time Scrubber",
+            shortcut: Some("Ctrl+Shift+H"),
+            intent: &["history scrubber", "time travel", "undo history", "show history bar"],
+        },
     ]
 }
 
@@ -163,16 +242,38 @@ impl CmdPaletteState {
         if q.is_empty() {
             self.filtered = (0..self.commands.len()).collect();
         } else {
+            let q_words: Vec<&str> = q.split_whitespace().collect();
             self.filtered = self
                 .commands
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| c.label.to_lowercase().contains(&q))
+                .filter(|(_, c)| {
+                    // Direct label substring match.
+                    if c.label.to_lowercase().contains(&q) {
+                        return true;
+                    }
+                    // Whisper Palette: check intent phrases.
+                    c.intent.iter().any(|phrase| {
+                        let p = phrase.to_lowercase();
+                        // All query words appear in the phrase, or the whole
+                        // query is a prefix of the phrase.
+                        q_words.iter().all(|w| p.contains(w)) || p.contains(&q)
+                    })
+                })
                 .map(|(i, _)| i)
                 .collect();
         }
         self.selected = 0;
     }
+}
+
+// ── ghost caret (choreographed diff) ─────────────────────────────────────────
+
+/// A fading ghost of the caret's previous position, left behind after large
+/// jumps (go-to-definition, search navigation, etc.).
+struct GhostCaret {
+    position: Point,
+    fade: Spring,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -227,6 +328,17 @@ struct App {
     // Phase 5: git diff
     git: Option<GitRepo>,
     diff_marks: Vec<(u32, DiffMark)>,
+
+    // Phase 6: semantic minimap
+    minimap_open: bool,
+
+    // Phase 6: time scrubber
+    scrubber_open: bool,
+    scrubber_rect: Option<Rect>,
+
+    // Phase 6: choreographed diff / go-to-definition navigation
+    ghost_caret: Option<GhostCaret>,
+    go_to_def_pending: bool,
 
     cursor: Option<Point>,
     scroll: Spring,
@@ -291,6 +403,11 @@ impl App {
             terminal: None,
             git,
             diff_marks: Vec::new(),
+            minimap_open: false,
+            scrubber_open: false,
+            scrubber_rect: None,
+            ghost_caret: None,
+            go_to_def_pending: false,
             cursor: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             prefs: MotionPrefs::from_env(),
@@ -368,7 +485,6 @@ impl App {
         if let Some(chrome) = &mut self.chrome {
             chrome.resize(f64::from(width), f64::from(height), self.scale);
         }
-        // Resize terminal if open.
         if let (Some(term), Some(chrome), Some(text)) =
             (&mut self.terminal, &self.chrome, &self.text)
         {
@@ -385,7 +501,6 @@ impl App {
     // ── keyboard ──────────────────────────────────────────────────────────
 
     fn on_key(&mut self, event: &KeyEvent) -> bool {
-        // Route to the terminal first if it has focus.
         if self.terminal.is_some()
             && self.chrome.as_ref().is_some_and(|c| c.terminal_open())
             && self.on_terminal_key(event)
@@ -419,6 +534,10 @@ impl App {
                 self.doc_dirty = true;
                 self.ensure_visible = true;
                 self.dismiss_completion();
+                // Focus Halo: dim chrome when typing in the editor.
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.enter_typing();
+                }
                 true
             }
             _ => false,
@@ -511,12 +630,10 @@ impl App {
                 true
             }
             ("p" | "P", true) => {
-                // Ctrl+Shift+P → command palette
                 self.open_cmd_palette();
                 true
             }
             ("f" | "F", true) => {
-                // Ctrl+Shift+F → project search
                 self.search_open = !self.search_open;
                 true
             }
@@ -525,8 +642,17 @@ impl App {
                 true
             }
             ("`", false) => {
-                // Ctrl+` → toggle terminal
                 self.toggle_terminal();
+                true
+            }
+            ("m" | "M", false) => {
+                // Phase 6: toggle semantic minimap.
+                self.minimap_open = !self.minimap_open;
+                true
+            }
+            ("h" | "H", true) => {
+                // Phase 6: toggle time scrubber (Ctrl+Shift+H).
+                self.scrubber_open = !self.scrubber_open;
                 true
             }
             _ => false,
@@ -558,13 +684,11 @@ impl App {
     }
 
     fn on_terminal_key(&mut self, event: &KeyEvent) -> bool {
-        // Only handle keys that aren't Ctrl+` (which toggles the terminal).
         let ctrl = self.mods.control_key();
         if ctrl && let Key::Character(s) = &event.logical_key {
             if s == "`" {
-                return false; // let the main handler toggle
+                return false;
             }
-            // Send Ctrl+key as ASCII control code.
             if let Some(c) = s.chars().next() {
                 let code = (c as u8).wrapping_sub(b'a').wrapping_add(1);
                 if let Some(term) = &mut self.terminal {
@@ -622,17 +746,14 @@ impl App {
                 let shift = self.mods.shift_key();
                 if ctrl {
                     match (s.as_str(), shift) {
-                        // Ctrl+I → toggle case sensitive
                         ("i" | "I", false) => {
                             self.search.case_sensitive = !self.search.case_sensitive;
                             self.start_search();
                         }
-                        // Ctrl+R → toggle regex
                         ("r" | "R", false) => {
                             self.search.is_regex = !self.search.is_regex;
                             self.start_search();
                         }
-                        // Ctrl+W → toggle whole word
                         ("w" | "W", false) => {
                             self.search.whole_word = !self.search.whole_word;
                             self.start_search();
@@ -670,6 +791,7 @@ impl App {
     fn open_search_result(&mut self) {
         let hit = self.search.hits.get(self.search.selected).cloned();
         let Some(hit) = hit else { return };
+        self.record_ghost_caret();
         self.open_path(&hit.path);
         let line = (hit.line_no as usize).saturating_sub(1);
         let char_idx = self.editor.buffer().line_to_char(line);
@@ -768,6 +890,12 @@ impl App {
             }
             CommandId::GoToDefinition => self.go_to_definition(),
             CommandId::TriggerCompletions => self.trigger_completions(),
+            CommandId::ToggleMinimap => {
+                self.minimap_open = !self.minimap_open;
+            }
+            CommandId::ToggleTimeScrubber => {
+                self.scrubber_open = !self.scrubber_open;
+            }
         }
     }
 
@@ -927,7 +1055,36 @@ impl App {
     fn go_to_definition(&mut self) {
         let Some(path) = self.current_path.clone() else { return };
         let Some(pos) = self.caret_lsp_position() else { return };
-        self.lsp.request_definition_logged(&path, pos);
+        self.lsp.request_definition(&path, pos);
+        self.go_to_def_pending = true;
+    }
+
+    /// Navigates to a definition URI+position returned by the LSP.
+    fn navigate_to_definition(&mut self, uri: &str, pos: LspPos) {
+        let Some(dest) = uri_to_path(uri) else {
+            tracing::warn!("could not parse definition URI: {uri}");
+            return;
+        };
+        self.record_ghost_caret();
+        if self.current_path.as_deref() != Some(&dest) {
+            self.open_path(&dest);
+        }
+        let char_idx =
+            self.editor.buffer().line_to_char(pos.line as usize) + pos.character as usize;
+        self.editor.set_caret(char_idx.min(self.editor.buffer().len_chars()));
+        self.ensure_visible = true;
+    }
+
+    // ── choreographed diff helpers ────────────────────────────────────────
+
+    /// Records the current caret's physical position as a ghost that fades out.
+    fn record_ghost_caret(&mut self) {
+        if let Some(pt) = self.caret_anchor() {
+            // design: ghost fades with a slow spring so it's readable during the jump.
+            let mut fade = Spring::with_config(1.0, self.prefs.resolve(SpringConfig::UNIT));
+            fade.set_target(0.0);
+            self.ghost_caret = Some(GhostCaret { position: pt, fade });
+        }
     }
 
     // ── git diff marks ────────────────────────────────────────────────────
@@ -1046,6 +1203,30 @@ impl App {
 
     fn on_click(&mut self) -> bool {
         let Some(point) = self.cursor else { return false };
+
+        // Phase 6: Time scrubber click — jump to that undo position.
+        if let Some(rect) = self.scrubber_rect
+            && rect.contains(point)
+        {
+            let total = self.editor.history_total();
+            if total > 0 {
+                let t = ((point.x - rect.x0) / rect.width()).clamp(0.0, 1.0);
+                let target = (t * total as f64).round() as usize;
+                let current = self.editor.history_pos();
+                if target < current {
+                    for _ in 0..(current - target) {
+                        self.editor.undo();
+                    }
+                } else {
+                    for _ in 0..(target - current) {
+                        self.editor.redo();
+                    }
+                }
+                self.doc_dirty = true;
+            }
+            return true;
+        }
+
         let Some(idx) = self.tree_row_at(point) else { return false };
         let entry = &self.tree.entries()[idx];
         if entry.is_dir {
@@ -1071,6 +1252,10 @@ impl App {
         action(&mut self.editor);
         if mutates {
             self.doc_dirty = true;
+            // Focus Halo: dim chrome on every mutating key.
+            if let Some(chrome) = &mut self.chrome {
+                chrome.enter_typing();
+            }
         }
         self.ensure_visible = true;
         true
@@ -1143,6 +1328,18 @@ impl App {
         self.maybe_request_hover();
         self.refresh_hover();
 
+        // Choreographed Diff: poll the LSP definition result and navigate.
+        if self.go_to_def_pending
+            && let Some(path) = &self.current_path.clone()
+            && let Some(result) = self.lsp.definition_result(path)
+        {
+            let uri = result.uri.clone();
+            let pos = result.position;
+            self.lsp.clear_definition(path);
+            self.go_to_def_pending = false;
+            self.navigate_to_definition(&uri, pos);
+        }
+
         // Drain search results from the background thread.
         if let Some(rx) = &self.search.rx {
             while let Ok(hit) = rx.try_recv() {
@@ -1168,10 +1365,29 @@ impl App {
         let chrome_moving = self.chrome.as_mut().is_some_and(|c| c.step(dt));
         let scroll_moving = self.scroll.step(dt);
 
+        // Step ghost caret fade spring.
+        let ghost_moving = if let Some(ghost) = &mut self.ghost_caret {
+            let still_moving = ghost.fade.step(dt);
+            if ghost.fade.value() < 0.005 {
+                self.ghost_caret = None;
+                false
+            } else {
+                still_moving
+            }
+        } else {
+            false
+        };
+
         let hover_pending = self.hover_requested_for != self.cursor
             && self.cursor_still_since.elapsed() < HOVER_DELAY;
         let search_streaming = self.search.rx.is_some() && self.search_open;
-        let animating = chrome_moving || scroll_moving || hover_pending || search_streaming;
+        let def_pending = self.go_to_def_pending;
+        let animating = chrome_moving
+            || scroll_moving
+            || ghost_moving
+            || hover_pending
+            || search_streaming
+            || def_pending;
 
         let caret_anchor = self.caret_anchor();
         let hover_card = self.hover_card.clone();
@@ -1295,6 +1511,67 @@ impl App {
             );
         }
 
+        // Phase 6 — Semantic Minimap (painted over the editor right edge).
+        if self.minimap_open
+            && let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome)
+        {
+            let palette = chrome.palette();
+            let syntax = chrome.syntax();
+            text.paint_minimap(
+                &mut self.scene,
+                chrome.editor_rect(),
+                &MinimapView {
+                    editor: &self.editor,
+                    highlights: &self.highlights,
+                    syntax: &syntax,
+                    scroll_px: self.scroll.value(),
+                },
+                &palette,
+                self.scale,
+            );
+        }
+
+        // Phase 6 — Time Scrubber.
+        if self.scrubber_open {
+            if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+                let palette = chrome.palette();
+                self.scrubber_rect = text.paint_time_scrubber(
+                    &mut self.scene,
+                    chrome.editor_rect(),
+                    &ScrubberView {
+                        undo_pos: self.editor.history_pos(),
+                        total: self.editor.history_total(),
+                    },
+                    &palette,
+                    self.scale,
+                );
+            }
+        } else {
+            self.scrubber_rect = None;
+        }
+
+        // Phase 6 — Ghost caret (Choreographed Diff).
+        if let (Some(ghost), Some(chrome), Some(text)) =
+            (&self.ghost_caret, &self.chrome, &self.text)
+        {
+            let palette = chrome.palette();
+            let alpha = (ghost.fade.value() * 200.0) as u8;
+            let ghost_color = Rgba8::rgba(palette.accent.r, palette.accent.g, palette.accent.b, alpha);
+            let caret_w = (2.0 * self.scale).max(1.5);
+            let line_h = text.line_height();
+            fill_rrect(
+                &mut self.scene,
+                Rect::new(
+                    ghost.position.x,
+                    ghost.position.y + 2.0 * self.scale,
+                    ghost.position.x + caret_w * 3.0,
+                    ghost.position.y + line_h - 2.0 * self.scale,
+                ),
+                caret_w,
+                ghost_color,
+            );
+        }
+
         // Terminal panel.
         if let (Some(term), Some(text), Some(chrome)) =
             (&self.terminal, &mut self.text, &self.chrome)
@@ -1353,7 +1630,7 @@ impl App {
             );
         }
 
-        // Command palette (drawn before Cmd-P so Ctrl+Shift+P takes precedence).
+        // Command palette.
         if let (Some(cp), Some(text), Some(chrome)) =
             (&self.cmd_palette, &mut self.text, &self.chrome)
         {
@@ -1381,7 +1658,7 @@ impl App {
             );
         }
 
-        // Cmd-P file palette (drawn last, on top of everything).
+        // Cmd-P file palette (topmost).
         if let Some(state) = &self.palette
             && let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome)
         {
@@ -1457,6 +1734,25 @@ impl App {
         }
         event_loop.exit();
     }
+}
+
+// ── URI helpers ───────────────────────────────────────────────────────────────
+
+/// Converts a `file://` URI from the LSP to a local [`PathBuf`].
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let without_scheme = uri.strip_prefix("file://")?;
+    // On Windows: file:///C:/path → /C:/path → strip leading slash.
+    let path_str = if cfg!(windows) && without_scheme.starts_with('/') {
+        without_scheme.trim_start_matches('/')
+    } else {
+        without_scheme
+    };
+    let decoded = path_str
+        .replace("%20", " ")
+        .replace("%2F", "/")
+        .replace("%5C", "\\")
+        .replace("%25", "%");
+    Some(PathBuf::from(decoded))
 }
 
 // ── ApplicationHandler ────────────────────────────────────────────────────────

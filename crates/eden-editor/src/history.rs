@@ -90,4 +90,14 @@ impl History {
     pub(crate) fn can_redo(&self) -> bool {
         !self.redo.is_empty()
     }
+
+    /// Number of undo steps available from the current position.
+    pub(crate) fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Number of redo steps available from the current position.
+    pub(crate) fn redo_depth(&self) -> usize {
+        self.redo.len()
+    }
 }

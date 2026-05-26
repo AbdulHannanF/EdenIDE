@@ -21,3 +21,9 @@ pub fn fill_rrect(scene: &mut Scene, rect: Rect, radius: f64, color: Rgba8) {
     let rounded = rect.to_rounded_rect(radius);
     scene.fill(Fill::NonZero, Affine::IDENTITY, to_color(color), None, &rounded);
 }
+
+/// Returns a copy of `color` with its alpha replaced by `alpha`.
+#[must_use]
+pub fn to_rgba8_alpha(color: Rgba8, alpha: u8) -> Rgba8 {
+    Rgba8::rgba(color.r, color.g, color.b, alpha)
+}

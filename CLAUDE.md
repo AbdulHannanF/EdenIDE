@@ -49,7 +49,7 @@ themes/
 | 3 | Syntax & Files — tree-sitter (Rust), file tree, Cmd-P | **Done** (`750bca9`) |
 | 4 | Intelligence — LSP client, completion, hover, diagnostics | **Done** (`730a95b`) |
 | 5 | Surroundings — project search, command palette, terminal, git | **Done** |
-| 6 | Signature features (pick 6 of 9) | Pending |
+| 6 | Signature features (pick 6 of 9) | **Done** |
 | 7 | Polish — settings UI, bundle, icon, telemetry | Pending |
 
 ---

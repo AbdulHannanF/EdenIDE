@@ -99,6 +99,10 @@ pub struct Chrome {
     terminal_h: Spring,
     terminal_open: bool,
 
+    // design: dims sidebar + tab strip while the user is typing in the editor,
+    // so eyes stay on the text. Breathes back when the cursor enters chrome.
+    focus_halo: Spring,
+
     invalid: Invalidation,
 
     title_bar: TitleBar,
@@ -168,6 +172,7 @@ impl Chrome {
             // design: terminal starts hidden (height 0).
             terminal_h: Spring::with_config(0.0, prefs.resolve(SpringConfig::DEFAULT)),
             terminal_open: false,
+            focus_halo: Spring::with_config(0.0, prefs.resolve(SpringConfig::DEFAULT)),
             invalid: Invalidation { layout: true, paint: true },
             title_bar: TitleBar,
             sidebar_panel: SidebarPanel,
@@ -246,6 +251,14 @@ impl Chrome {
             }
             None => self.hover.set_target(0.0),
         }
+        // Breathe the focus halo back when the cursor enters any chrome region
+        // that isn't the editor canvas (sidebar, tab strip, title bar, status).
+        if matches!(
+            region,
+            Some(Region::Sidebar | Region::TabStrip | Region::TitleBar | Region::StatusBar)
+        ) {
+            self.focus_halo.set_target(0.0);
+        }
         self.invalid.paint = true;
     }
 
@@ -271,6 +284,10 @@ impl Chrome {
             self.invalid.layout = true;
             self.invalid.paint = true;
         }
+        if self.focus_halo.step(dt) {
+            animating = true;
+            self.invalid.paint = true;
+        }
         animating
     }
 
@@ -290,6 +307,19 @@ impl Chrome {
     #[must_use]
     pub fn syntax(&self) -> Syntax {
         self.displayed_syntax()
+    }
+
+    /// Called when the user types in the editor. Activates the focus halo,
+    /// dimming the sidebar and tab strip to keep attention on the text.
+    pub fn enter_typing(&mut self) {
+        self.focus_halo.set_target(1.0);
+        self.invalid.paint = true;
+    }
+
+    /// The current focus-halo intensity (0 = chrome visible, 1 = chrome dimmed).
+    #[must_use]
+    pub fn focus_halo_value(&self) -> f64 {
+        self.focus_halo.value()
     }
 
     /// Toggles the embedded terminal panel open or closed.
@@ -368,6 +398,21 @@ impl Chrome {
         }
 
         self.paint_dividers(scene, &palette);
+
+        // Focus halo: dim sidebar + tab strip when typing in the editor.
+        let halo = self.focus_halo.value();
+        if halo > 0.01 {
+            let alpha = (halo * 96.0) as u8;
+            let dim = crate::paint::to_rgba8_alpha(palette.background, alpha);
+            let sidebar_r = self.region_rect(Region::Sidebar);
+            let tab_r = self.region_rect(Region::TabStrip);
+            for rect in [sidebar_r, tab_r] {
+                if rect.width() > 1.0 && rect.height() > 1.0 {
+                    fill_rect(scene, rect, dim);
+                }
+            }
+        }
+
         self.invalid.paint = false;
     }
 

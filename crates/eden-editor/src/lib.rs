@@ -87,6 +87,18 @@ impl Editor {
         self.history.can_redo()
     }
 
+    /// Number of undo steps available (current position in the history stack).
+    #[must_use]
+    pub fn history_pos(&self) -> usize {
+        self.history.undo_depth()
+    }
+
+    /// Total history depth: undo steps available plus redo steps available.
+    #[must_use]
+    pub fn history_total(&self) -> usize {
+        self.history.undo_depth() + self.history.redo_depth()
+    }
+
     fn len(&self) -> usize {
         self.buffer.len_chars()
     }

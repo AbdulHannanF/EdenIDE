@@ -500,6 +500,7 @@ dependencies = [
  "eden-motion",
  "eden-search",
  "eden-terminal",
+ "eden-theme",
  "eden-ui",
  "eden-vcs",
  "eden-workspace",

@@ -46,6 +46,15 @@ pub struct HoverCard {
     pub contents: String,
 }
 
+/// The resolved target location from a go-to-definition request.
+#[derive(Clone, Debug)]
+pub struct DefinitionResult {
+    /// File URI as returned by the language server (`file:///...`).
+    pub uri: String,
+    /// Zero-indexed position within the file.
+    pub position: Position,
+}
+
 /// A single completion candidate.
 #[derive(Clone, Debug)]
 pub struct CompletionItem {

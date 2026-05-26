@@ -20,7 +20,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::mpsc;
 
 use crate::rpc::{self, IncomingMessage};
-use crate::types::{CompletionItem, Diagnostic, HoverCard, Position, Severity};
+use crate::types::{CompletionItem, DefinitionResult, Diagnostic, HoverCard, Position, Severity};
 
 // ── shared-state aliases ──────────────────────────────────────────────────────
 
@@ -41,6 +41,8 @@ pub struct LspClient {
     completions: Arc<Mutex<Vec<CompletionItem>>>,
     hover_req_id: Arc<Mutex<Option<u64>>>,
     completion_req_id: Arc<Mutex<Option<u64>>>,
+    definition: Arc<Mutex<Option<DefinitionResult>>>,
+    definition_req_id: Arc<Mutex<Option<u64>>>,
     /// Keeps the child process alive while the client exists.
     _child: Arc<Mutex<Child>>,
 }
@@ -82,6 +84,8 @@ impl LspClient {
         let completions: Arc<Mutex<Vec<CompletionItem>>> = Arc::default();
         let hover_req_id: Arc<Mutex<Option<u64>>> = Arc::default();
         let completion_req_id: Arc<Mutex<Option<u64>>> = Arc::default();
+        let definition: Arc<Mutex<Option<DefinitionResult>>> = Arc::default();
+        let definition_req_id: Arc<Mutex<Option<u64>>> = Arc::default();
 
         handle.spawn(write_loop(tokio::io::BufWriter::new(stdin), rx));
         handle.spawn(read_loop(
@@ -94,6 +98,8 @@ impl LspClient {
             completions.clone(),
             hover_req_id.clone(),
             completion_req_id.clone(),
+            definition.clone(),
+            definition_req_id.clone(),
         ));
 
         let client = Self {
@@ -106,6 +112,8 @@ impl LspClient {
             completions,
             hover_req_id,
             completion_req_id,
+            definition,
+            definition_req_id,
             _child: Arc::new(Mutex::new(child)),
         };
 
@@ -223,11 +231,12 @@ impl LspClient {
         self.completions.lock().unwrap().clone()
     }
 
-    /// Fires a `textDocument/definition` request and returns the request id.
-    /// The result is delivered by the read loop; callers poll via the pending
-    /// table (Phase 4 follow-up: expose a dedicated channel).
+    /// Fires a `textDocument/definition` request. The result is available via
+    /// [`definition_result`][Self::definition_result] on a subsequent frame.
     pub fn request_definition(&self, uri: &str, pos: Position) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        *self.definition_req_id.lock().unwrap() = Some(id);
+        self.definition.lock().unwrap().take();
         self.enqueue_or_send(rpc::frame_request(
             id,
             "textDocument/definition",
@@ -237,6 +246,16 @@ impl LspClient {
             }),
         ));
         id
+    }
+
+    /// The most recently received definition result, if any.
+    pub fn definition_result(&self) -> Option<DefinitionResult> {
+        self.definition.lock().unwrap().clone()
+    }
+
+    /// Discards the cached definition result.
+    pub fn clear_definition(&self) {
+        self.definition.lock().unwrap().take();
     }
 
     // ── internals ─────────────────────────────────────────────────────────
@@ -279,6 +298,8 @@ async fn read_loop(
     completions: Arc<Mutex<Vec<CompletionItem>>>,
     hover_req_id: Arc<Mutex<Option<u64>>>,
     completion_req_id: Arc<Mutex<Option<u64>>>,
+    definition: Arc<Mutex<Option<DefinitionResult>>>,
+    definition_req_id: Arc<Mutex<Option<u64>>>,
 ) {
     loop {
         match rpc::read_message(&mut reader).await {
@@ -292,6 +313,8 @@ async fn read_loop(
                 &completions,
                 &hover_req_id,
                 &completion_req_id,
+                &definition,
+                &definition_req_id,
             ),
             Ok(None) => {
                 tracing::info!("LSP server closed connection");
@@ -316,6 +339,8 @@ fn handle_message(
     completions: &Mutex<Vec<CompletionItem>>,
     hover_req_id: &Mutex<Option<u64>>,
     completion_req_id: &Mutex<Option<u64>>,
+    definition: &Mutex<Option<DefinitionResult>>,
+    definition_req_id: &Mutex<Option<u64>>,
 ) {
     let is_init_response =
         msg.id.is_some() && !initialized.load(Ordering::Acquire) && msg.result.is_some();
@@ -331,14 +356,14 @@ fn handle_message(
         }
         tracing::info!("LSP server initialised");
     } else if let Some(id) = msg.id {
-        // Response to one of our requests.
         let result = msg.result.unwrap_or(Value::Null);
         if hover_req_id.lock().unwrap().is_some_and(|h| h == id) {
             *hover.lock().unwrap() = parse_hover(&result);
         } else if completion_req_id.lock().unwrap().is_some_and(|c| c == id) {
             *completions.lock().unwrap() = parse_completions(&result);
+        } else if definition_req_id.lock().unwrap().is_some_and(|d| d == id) {
+            *definition.lock().unwrap() = parse_definition(&result);
         }
-        // go-to-definition and other request results: Phase 4 follow-up.
     } else if let Some(ref method) = msg.method {
         handle_notification(method, msg.params, diagnostics);
     }
@@ -421,6 +446,29 @@ fn parse_completion_item(v: &Value) -> Option<CompletionItem> {
     let insert_text = v["insertText"].as_str().unwrap_or(&label).to_owned();
     let detail = v["detail"].as_str().map(ToOwned::to_owned);
     Some(CompletionItem { label, insert_text, detail })
+}
+
+fn parse_definition(v: &Value) -> Option<DefinitionResult> {
+    // Handle Location, LocationLink, or array thereof.
+    let item = if v.is_array() {
+        v.as_array()?.first()?
+    } else if v.is_null() {
+        return None;
+    } else {
+        v
+    };
+    let uri = item["uri"]
+        .as_str()
+        .or_else(|| item["targetUri"].as_str())?
+        .to_owned();
+    let range = if item["targetSelectionRange"].is_object() {
+        &item["targetSelectionRange"]
+    } else {
+        &item["range"]
+    };
+    let line = range["start"]["line"].as_u64()? as u32;
+    let character = range["start"]["character"].as_u64()? as u32;
+    Some(DefinitionResult { uri, position: Position { line, character } })
 }
 
 #[cfg(test)]

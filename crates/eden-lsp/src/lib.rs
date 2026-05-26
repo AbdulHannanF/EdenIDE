@@ -15,7 +15,7 @@ mod rpc;
 mod types;
 
 pub use client::LspClient;
-pub use types::{CompletionItem, Diagnostic, HoverCard, Position, Severity};
+pub use types::{CompletionItem, DefinitionResult, Diagnostic, HoverCard, Position, Severity};
 
 use std::path::Path;
 use std::sync::OnceLock;
@@ -156,16 +156,33 @@ impl LspPool {
             .unwrap_or_default()
     }
 
-    // ── internals ─────────────────────────────────────────────────────────
+    // ── go-to-definition ──────────────────────────────────────────────────
 
-    /// Fires a `textDocument/definition` request and logs the result when it
-    /// arrives. Phase 4 follow-up: expose the result to the UI for navigation.
-    pub fn request_definition_logged(&self, path: &Path, pos: Position) {
+    /// Fires a `textDocument/definition` request. The result is available via
+    /// [`definition_result`][Self::definition_result] on a subsequent frame.
+    pub fn request_definition(&self, path: &Path, pos: Position) {
         let Some(lang) = language_id(path) else { return };
         let Some(client) = self.client_for(lang) else { return };
         let id = client.request_definition(&path_to_uri(path), pos);
         tracing::debug!(id, "go-to-definition requested");
     }
+
+    /// The most recently received definition result, if any.
+    #[must_use]
+    pub fn definition_result(&self, path: &Path) -> Option<DefinitionResult> {
+        let lang = language_id(path)?;
+        self.client_for(lang)?.definition_result()
+    }
+
+    /// Discards the cached definition result.
+    pub fn clear_definition(&self, path: &Path) {
+        let Some(lang) = language_id(path) else { return };
+        if let Some(client) = self.client_for(lang) {
+            client.clear_definition();
+        }
+    }
+
+    // ── internals ─────────────────────────────────────────────────────────
 
     fn client_for(&self, lang: &str) -> Option<&LspClient> {
         match lang {
