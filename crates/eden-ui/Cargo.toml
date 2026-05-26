@@ -11,6 +11,8 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+cosmic-text = "0.19.0"
+eden-editor.workspace = true
 eden-motion.workspace = true
 eden-theme.workspace = true
 taffy = "0.10.1"

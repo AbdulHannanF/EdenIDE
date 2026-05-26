@@ -255,6 +255,21 @@ impl Chrome {
         self.invalid.paint
     }
 
+    /// The palette currently being displayed (interpolated mid-crossfade).
+    #[must_use]
+    pub fn palette(&self) -> Palette {
+        self.displayed_palette()
+    }
+
+    /// The absolute rect of the editor canvas, where text is drawn.
+    #[must_use]
+    pub fn editor_rect(&self) -> Rect {
+        self.regions()
+            .into_iter()
+            .find(|(region, _)| *region == Region::EditorArea)
+            .map_or(Rect::ZERO, |(_, rect)| rect)
+    }
+
     /// Hit-tests a physical-pixel point to the region containing it.
     #[must_use]
     pub fn hit_test(&self, point: Point) -> Option<Region> {

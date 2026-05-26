@@ -145,40 +145,15 @@ impl Widget for TabStrip {
     }
 }
 
-/// The editor canvas: gutter, current-line highlight, and a resting caret.
+/// The editor canvas. Just the background — real text, gutter, selections, and
+/// carets are drawn over this rect by [`crate::TextSystem`], which owns the
+/// editor model and shaping.
 #[derive(Default)]
 pub struct EditorArea;
 
 impl Widget for EditorArea {
     fn paint(&self, scene: &mut Scene, bounds: Rect, ctx: &PaintCtx) {
-        let s = ctx.scale;
-        let p = ctx.palette;
-        fill_rect(scene, bounds, p.background);
-
-        // Gutter band.
-        let gutter_w = 54.0 * s;
-        fill_rect(
-            scene,
-            Rect::new(bounds.x0, bounds.y0, bounds.x0 + gutter_w, bounds.y1),
-            p.surface,
-        );
-
-        // Current-line wash + resting caret, two lines down.
-        let line_h = 22.0 * s;
-        let line_y = bounds.y0 + line_h * 2.0;
-        if line_y + line_h < bounds.y1 {
-            fill_rect(
-                scene,
-                Rect::new(bounds.x0 + gutter_w, line_y, bounds.x1, line_y + line_h),
-                p.selection,
-            );
-            let caret_x = bounds.x0 + gutter_w + 12.0 * s;
-            fill_rect(
-                scene,
-                Rect::new(caret_x, line_y + 3.0 * s, caret_x + 2.0 * s, line_y + line_h - 3.0 * s),
-                p.accent,
-            );
-        }
+        fill_rect(scene, bounds, ctx.palette.background);
     }
 }
 

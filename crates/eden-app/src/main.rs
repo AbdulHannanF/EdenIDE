@@ -1,18 +1,20 @@
 //! Eden — the application binary.
 //!
-//! Phase 1 ("The Surface"): the window now hosts the editor chrome — title bar,
-//! sidebar, tab strip, editor canvas, and status bar — laid out by taffy, drawn
-//! through vello, and themed. Motion is live: `B` toggles the sidebar (its width
-//! springs), `T` crossfades between the three built-in themes, and hovering the
-//! sidebar or tabs eases in a highlight. With `ControlFlow::Wait` the app idles
-//! at zero cost and only schedules frames while a spring is in motion.
+//! Phase 2 ("The Buffer"): the editor canvas now hosts a real, editable text
+//! buffer. Typing inserts; arrows move (Shift extends); Backspace/Delete,
+//! Home/End, Enter, and Tab behave; Ctrl+Z/Ctrl+Shift+Z undo/redo; Ctrl+A
+//! selects all; the mouse wheel scrolls with momentum (spring-driven). Only the
+//! visible lines are shaped each frame, so large files stay responsive.
+//!
+//! Chrome controls move under a modifier so letters type: Ctrl+B toggles the
+//! sidebar, Ctrl+T crossfades the theme.
 
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context as _, Result};
-use eden_motion::MotionPrefs;
-use eden_ui::Chrome;
+use eden_motion::{MotionPrefs, Spring, SpringConfig};
+use eden_ui::{Chrome, Editor, EditorFrame, TextSystem};
 use vello::kurbo::Point;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
@@ -20,15 +22,25 @@ use vello::wgpu;
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-// design: the clear colour shows only on frames the scene doesn't fully cover
-// (it always does), so a neutral paper white matching the default Eden Day theme
-// avoids any first-frame flash.
 const CLEAR: Color = Color::from_rgb8(0xFB, 0xF8, 0xF3);
+
+const SAMPLE: &str = "// Eden — Phase 2: a real, editable buffer.\n\
+fn main() {\n\
+    let greeting = \"hello, eden\";\n\
+    let mut total = 0u64;\n\
+    for (i, ch) in greeting.char_indices() {\n\
+        total += (i as u64) * (ch as u64);\n\
+    }\n\
+    println!(\"{greeting}: {total}\");\n\
+}\n\
+\n\
+// Try it: type anywhere, select with Shift+arrows, Ctrl+Z to undo.\n\
+// Ctrl+B toggles the sidebar; Ctrl+T crossfades the theme.\n";
 
 fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -43,14 +55,20 @@ fn main() -> Result<()> {
     app.into_result()
 }
 
-/// Top-level application state, driven by winit's [`ApplicationHandler`].
 struct App {
     context: RenderContext,
     renderers: Vec<Option<Renderer>>,
     state: WindowState,
     scene: Scene,
     chrome: Option<Chrome>,
+    text: Option<TextSystem>,
+    editor: Editor,
+    scroll: Spring,
     prefs: MotionPrefs,
+    mods: ModifiersState,
+    focused: bool,
+    scale: f64,
+    ensure_visible: bool,
     last_frame: Instant,
     fatal: Option<anyhow::Error>,
 }
@@ -73,7 +91,14 @@ impl App {
             state: WindowState::Suspended,
             scene: Scene::new(),
             chrome: None,
+            text: None,
+            editor: Editor::from_text(SAMPLE),
+            scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             prefs: MotionPrefs::from_env(),
+            mods: ModifiersState::empty(),
+            focused: true,
+            scale: 1.0,
+            ensure_visible: false,
             last_frame: Instant::now(),
             fatal: None,
         }
@@ -144,39 +169,141 @@ impl App {
             return;
         };
         self.context.resize_surface(&mut active.surface, width, height);
-        let scale = active.window.scale_factor();
+        self.scale = active.window.scale_factor();
         if let Some(chrome) = &mut self.chrome {
-            chrome.resize(f64::from(width), f64::from(height), scale);
+            chrome.resize(f64::from(width), f64::from(height), self.scale);
         }
         active.window.request_redraw();
     }
 
-    /// Handles a key press. Returns `true` if it changed anything visible.
-    fn on_key(&mut self, code: KeyCode) -> bool {
-        let Some(chrome) = &mut self.chrome else {
-            return false;
-        };
-        match code {
-            KeyCode::KeyB => {
-                chrome.toggle_sidebar();
-                true
-            }
-            KeyCode::KeyT => {
-                let next = chrome.active_theme_name().to_owned();
-                chrome.cycle_theme();
-                tracing::info!(from = %next, to = %chrome.active_theme_name(), "theme cycled");
+    /// Handles a key press. Returns `true` if a repaint is needed.
+    fn on_key(&mut self, event: &KeyEvent) -> bool {
+        let ctrl = self.mods.control_key() || self.mods.super_key();
+        let shift = self.mods.shift_key();
+        match &event.logical_key {
+            Key::Named(named) => self.on_named_key(*named, shift),
+            Key::Character(s) if ctrl => self.on_command(s),
+            Key::Character(s) => {
+                self.editor.insert(s);
+                self.ensure_visible = true;
                 true
             }
             _ => false,
         }
     }
 
+    fn on_named_key(&mut self, named: NamedKey, shift: bool) -> bool {
+        match named {
+            NamedKey::Enter => self.edit(|e| e.insert("\n")),
+            NamedKey::Tab => self.edit(|e| e.insert("    ")),
+            NamedKey::Backspace => self.edit(Editor::backspace),
+            NamedKey::Delete => self.edit(Editor::delete_forward),
+            NamedKey::Space => self.edit(|e| e.insert(" ")),
+            NamedKey::ArrowLeft => self.edit(|e| e.move_left(shift)),
+            NamedKey::ArrowRight => self.edit(|e| e.move_right(shift)),
+            NamedKey::ArrowUp => self.edit(|e| e.move_up(shift)),
+            NamedKey::ArrowDown => self.edit(|e| e.move_down(shift)),
+            NamedKey::Home => self.edit(|e| e.move_line_start(shift)),
+            NamedKey::End => self.edit(|e| e.move_line_end(shift)),
+            NamedKey::PageUp => {
+                self.scroll_by_page(-1.0);
+                true
+            }
+            NamedKey::PageDown => {
+                self.scroll_by_page(1.0);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn on_command(&mut self, key: &str) -> bool {
+        match key {
+            "b" | "B" => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.toggle_sidebar();
+                }
+                true
+            }
+            "t" | "T" => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.cycle_theme();
+                }
+                true
+            }
+            "z" | "Z" => self.edit(|e| {
+                e.undo();
+            }),
+            "y" | "Y" => self.edit(|e| {
+                e.redo();
+            }),
+            "a" | "A" => self.edit(Editor::select_all),
+            _ => false,
+        }
+    }
+
+    /// Runs an editor mutation and schedules a scroll-to-caret.
+    fn edit(&mut self, action: impl FnOnce(&mut Editor)) -> bool {
+        action(&mut self.editor);
+        self.ensure_visible = true;
+        true
+    }
+
+    fn scroll_by_page(&mut self, pages: f64) {
+        let view_h = self
+            .chrome
+            .as_ref()
+            .map_or(400.0, |c| c.editor_rect().height());
+        self.scroll.set_target(self.scroll.target() + pages * view_h * 0.9);
+    }
+
+    /// Clamps the scroll target to the valid range for the current content.
+    fn clamp_scroll(&mut self) {
+        let (Some(text), Some(chrome)) = (&self.text, &self.chrome) else {
+            return;
+        };
+        let max = (self.editor.buffer().len_lines() as f64 * text.line_height()
+            - chrome.editor_rect().height())
+        .max(0.0);
+        let clamped = self.scroll.target().clamp(0.0, max);
+        if (clamped - self.scroll.target()).abs() > f64::EPSILON {
+            self.scroll.set_target(clamped);
+        }
+    }
+
+    /// Scrolls just enough to bring the primary caret into view.
+    fn ensure_caret_visible(&mut self) {
+        if !self.ensure_visible {
+            return;
+        }
+        self.ensure_visible = false;
+        let (Some(text), Some(chrome)) = (&self.text, &self.chrome) else {
+            return;
+        };
+        let line_h = text.line_height();
+        let view_h = chrome.editor_rect().height();
+        let caret_line = self.editor.buffer().char_to_line(self.editor.primary().head) as f64;
+        let caret_top = caret_line * line_h;
+        let mut target = self.scroll.target();
+        if caret_top < target {
+            target = caret_top;
+        } else if caret_top + line_h > target + view_h {
+            target = caret_top + line_h - view_h;
+        }
+        let max = (self.editor.buffer().len_lines() as f64 * line_h - view_h).max(0.0);
+        self.scroll.set_target(target.clamp(0.0, max));
+    }
+
     fn render(&mut self) -> Result<()> {
-        // Advance animations by the real elapsed time since the last frame.
+        self.clamp_scroll();
+        self.ensure_caret_visible();
+
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
-        let animating = self.chrome.as_mut().is_some_and(|c| c.step(dt));
+        let chrome_moving = self.chrome.as_mut().is_some_and(|c| c.step(dt));
+        let scroll_moving = self.scroll.step(dt);
+        let animating = chrome_moving || scroll_moving;
 
         let WindowState::Active(active) = &mut self.state else {
             return Ok(());
@@ -200,6 +327,20 @@ impl App {
         self.scene.reset();
         if let Some(chrome) = &mut self.chrome {
             chrome.paint(&mut self.scene);
+        }
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let palette = chrome.palette();
+            text.paint_editor(
+                &mut self.scene,
+                &EditorFrame {
+                    area: chrome.editor_rect(),
+                    editor: &self.editor,
+                    palette: &palette,
+                    scroll_px: self.scroll.value(),
+                    scale: self.scale,
+                    show_caret: self.focused,
+                },
+            );
         }
 
         let device_handle = &self.context.devices[dev_id];
@@ -244,7 +385,6 @@ impl App {
         active.window.pre_present_notify();
         surface_texture.present();
 
-        // Keep the frame loop alive only while something is still moving.
         if animating {
             active.window.request_redraw();
         }
@@ -270,18 +410,21 @@ impl ApplicationHandler for App {
             Err(err) => return self.fail(event_loop, err),
         };
 
+        self.scale = active.window.scale_factor();
         if self.chrome.is_none() {
             let size = active.window.inner_size();
-            let scale = active.window.scale_factor();
             match Chrome::new(
                 f64::from(size.width.max(1)),
                 f64::from(size.height.max(1)),
-                scale,
+                self.scale,
                 self.prefs,
             ) {
                 Ok(chrome) => self.chrome = Some(chrome),
                 Err(err) => return self.fail(event_loop, anyhow::anyhow!("build chrome: {err}")),
             }
+        }
+        if self.text.is_none() {
+            self.text = Some(TextSystem::new(self.scale));
         }
 
         self.last_frame = Instant::now();
@@ -302,6 +445,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                self.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.mods = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(chrome) = &mut self.chrome {
                     chrome.set_hover(Some(Point::new(position.x, position.y)));
@@ -314,17 +462,24 @@ impl ApplicationHandler for App {
                 }
                 self.request_redraw();
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let line_h = self.text.as_ref().map_or(20.0, TextSystem::line_height);
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => f64::from(y) * line_h * 3.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y,
+                };
+                self.scroll.set_target(self.scroll.target() - dy);
+                self.request_redraw();
+            }
             WindowEvent::KeyboardInput {
                 event:
-                    KeyEvent {
-                        physical_key: PhysicalKey::Code(code),
+                    key_event @ KeyEvent {
                         state: ElementState::Pressed,
-                        repeat: false,
                         ..
                     },
                 ..
             } => {
-                let changed = self.on_key(code);
+                let changed = self.on_key(&key_event);
                 if changed {
                     self.request_redraw();
                 }

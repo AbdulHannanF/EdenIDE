@@ -8,9 +8,14 @@
 mod chrome;
 mod paint;
 mod panels;
+mod text;
 mod widget;
 
 pub use chrome::{Chrome, Region};
 pub use paint::{fill_rect, fill_rrect, to_color};
 pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TitleBar};
+pub use text::{EditorFrame, TextSystem};
 pub use widget::{PaintCtx, Widget};
+
+// Re-exported so callers can build/drive an editor without a direct dependency.
+pub use eden_editor::Editor;
