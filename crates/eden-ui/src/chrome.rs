@@ -197,6 +197,12 @@ impl Chrome {
         &self.themes[self.active_theme].name
     }
 
+    /// The index of the currently active theme.
+    #[must_use]
+    pub fn active_theme_index(&self) -> usize {
+        self.active_theme
+    }
+
     /// Updates the window size and scale, relaying out on the next paint.
     pub fn resize(&mut self, width: f64, height: f64, scale: f64) {
         self.width = width;
@@ -351,6 +357,12 @@ impl Chrome {
     #[must_use]
     pub fn sidebar_rect(&self) -> Rect {
         self.region_rect(Region::Sidebar)
+    }
+
+    /// The absolute rect of the tab strip.
+    #[must_use]
+    pub fn tab_strip_rect(&self) -> Rect {
+        self.region_rect(Region::TabStrip)
     }
 
     /// The absolute rect of the terminal panel.

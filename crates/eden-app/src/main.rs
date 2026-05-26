@@ -27,8 +27,8 @@ use eden_theme::Rgba8;
 use eden_ui::{
     Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
     EditorFrame, GutterMark, Highlighter, Highlights, MinimapView, PaletteView, SearchPanelView,
-    SearchRowView, ScrubberView, TerminalView, TextSystem, TreeRow, TreeView,
-    fill_rrect,
+    SearchRowView, ScrubberView, SettingsToggle, SettingsView, TerminalView, TextSystem, TreeRow,
+    TreeView, fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -49,6 +49,9 @@ const CLEAR: Color = Color::from_rgb8(0xFB, 0xF8, 0xF3);
 /// Cursor must be still for this long before a hover request is fired.
 const HOVER_DELAY: Duration = Duration::from_millis(400);
 
+/// Full period of the caret's sine-wave brightness pulse (§7.6).
+const CARET_PERIOD: f64 = 1.1;
+
 const SAMPLE: &str = "// Eden — Phase 6: Signature Features.\n\
 //\n\
 // Ctrl+M             toggle semantic minimap\n\
@@ -66,6 +69,81 @@ fn main() {\n\
     }\n\
     println!(\"{greeting}: {total}\");\n\
 }\n";
+
+// ── project root helpers ──────────────────────────────────────────────────────
+
+/// Detects the workspace root in priority order:
+/// 1. A directory path passed as the first CLI argument (`eden /path/to/project`).
+/// 2. Walking up from the executable until `Cargo.toml` or `.git` is found —
+///    prevents opening `target/debug/` when the binary is run directly from
+///    inside the build output directory.
+/// 3. The process's current working directory.
+fn detect_project_root() -> PathBuf {
+    // Priority 1: explicit path argument.
+    if let Some(arg) = std::env::args().nth(1) {
+        let p = PathBuf::from(&arg);
+        if p.is_dir() {
+            return p.canonicalize().unwrap_or(p);
+        }
+    }
+    // Priority 2: walk up from the executable to find a workspace root.
+    if let Ok(exe) = std::env::current_exe() {
+        let mut candidate = exe.parent().map(|p| p.to_path_buf());
+        while let Some(dir) = candidate {
+            if dir.join("Cargo.toml").exists() || dir.join(".git").exists() {
+                return dir;
+            }
+            candidate = dir.parent().map(|p| p.to_path_buf());
+        }
+    }
+    // Priority 3: current working directory (normal `cargo run` case).
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Known text-file extensions that are safe to open in the editor.
+const TEXT_EXTENSIONS: &[&str] = &[
+    "rs", "toml", "md", "txt", "json", "yaml", "yml", "ts", "tsx", "js", "jsx",
+    "py", "go", "c", "h", "cpp", "cc", "cxx", "css", "html", "htm", "sh",
+    "lock", "env", "xml", "gitignore", "editorconfig", "cfg", "ini", "csv",
+];
+
+/// Returns `true` if the file looks like renderable text — either by having a
+/// known extension or by passing a UTF-8 sniff of the first 512 bytes. Binary
+/// artifacts (`.rlib`, `.d`, `.rmeta`, etc.) return `false`.
+fn is_text_path(path: &std::path::Path) -> bool {
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && TEXT_EXTENSIONS.contains(&ext.to_lowercase().as_str())
+    {
+        return true;
+    }
+    // Sniff: read the first 512 bytes and check that they are valid UTF-8.
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut buf = [0u8; 512];
+    use std::io::Read as _;
+    let n = file.read(&mut buf).unwrap_or(0);
+    std::str::from_utf8(&buf[..n]).is_ok()
+}
+
+/// Returns `true` if `path` lives inside the workspace `target/` directory.
+/// Used to block accidental display of build artifacts when the file tree
+/// root detection falls back to a stale working directory.
+fn is_in_target_dir(path: &std::path::Path, project_root: &std::path::Path) -> bool {
+    path.strip_prefix(project_root)
+        .map(|rel| rel.starts_with("target"))
+        .unwrap_or(false)
+}
+
+/// Maps a file extension to a language identifier for syntax highlighting.
+/// Returns `None` for languages not yet wired (they render as plain text).
+fn language_for_path(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension().and_then(|e| e.to_str())?.to_lowercase();
+    match ext.as_str() {
+        "rs" => Some("rust"),
+        _ => None,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -267,6 +345,26 @@ impl CmdPaletteState {
     }
 }
 
+// ── settings panel ───────────────────────────────────────────────────────────
+
+/// Live user preferences controlled by the settings panel (Ctrl+,).
+///
+/// Boolean feature states (minimap, scrubber, etc.) are tracked directly on
+/// `App`; this struct holds the style/layout preferences that don't map to
+/// existing toggles.
+struct SettingsState {
+    /// Font size in logical pixels (clamped 10–24).
+    font_size: u32,
+    /// Tab width in spaces (2, 4, or 8).
+    tab_width: u32,
+}
+
+impl Default for SettingsState {
+    fn default() -> Self {
+        Self { font_size: 14, tab_width: 4 }
+    }
+}
+
 // ── ghost caret (choreographed diff) ─────────────────────────────────────────
 
 /// A fading ghost of the caret's previous position, left behind after large
@@ -329,6 +427,10 @@ struct App {
     git: Option<GitRepo>,
     diff_marks: Vec<(u32, DiffMark)>,
 
+    // Phase 7: settings panel
+    settings_open: bool,
+    settings: SettingsState,
+
     // Phase 6: semantic minimap
     minimap_open: bool,
 
@@ -342,6 +444,14 @@ struct App {
 
     cursor: Option<Point>,
     scroll: Spring,
+    // design: horizontal scroll offset in physical pixels. No spring — pixel
+    // exact so long lines stay readable during horizontal arrow/wheel movement.
+    h_scroll: f64,
+    // design: caret pulse — phase advances by dt/CARET_PERIOD each frame and
+    // resets on keystrokes so a bright spike greets each new character (§7.6).
+    caret_phase: f64,
+    // Timestamp of the last horizontal scroll event; drives the fade-out timer.
+    h_scroll_last: Instant,
     prefs: MotionPrefs,
     mods: ModifiersState,
     focused: bool,
@@ -363,7 +473,7 @@ struct ActiveWindow {
 
 impl App {
     fn new() -> Self {
-        let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let root = detect_project_root();
         let project = Project::new(root.clone());
         let files = project.file_strings();
         let tree = FileTree::new(project.root());
@@ -403,6 +513,8 @@ impl App {
             terminal: None,
             git,
             diff_marks: Vec::new(),
+            settings_open: false,
+            settings: SettingsState::default(),
             minimap_open: false,
             scrubber_open: false,
             scrubber_rect: None,
@@ -410,6 +522,9 @@ impl App {
             go_to_def_pending: false,
             cursor: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
+            h_scroll: 0.0,
+            caret_phase: 0.0,
+            h_scroll_last: Instant::now(),
             prefs: MotionPrefs::from_env(),
             mods: ModifiersState::empty(),
             focused: true,
@@ -534,6 +649,8 @@ impl App {
                 self.doc_dirty = true;
                 self.ensure_visible = true;
                 self.dismiss_completion();
+                // Bright spike on each keystroke (§7.6).
+                self.caret_phase = 0.0;
                 // Focus Halo: dim chrome when typing in the editor.
                 if let Some(chrome) = &mut self.chrome {
                     chrome.enter_typing();
@@ -653,6 +770,11 @@ impl App {
             ("h" | "H", true) => {
                 // Phase 6: toggle time scrubber (Ctrl+Shift+H).
                 self.scrubber_open = !self.scrubber_open;
+                true
+            }
+            (",", false) => {
+                // Phase 7: open settings panel (Ctrl+,).
+                self.settings_open = !self.settings_open;
                 true
             }
             _ => false,
@@ -1031,12 +1153,54 @@ impl App {
     // ── file opening ──────────────────────────────────────────────────────
 
     fn open_path(&mut self, path: &std::path::Path) {
+        // Guard: never open build artifacts from target/.
+        if is_in_target_dir(path, self.project.root()) {
+            tracing::debug!(file = %path.display(), "skipped target/ artifact");
+            return;
+        }
+
+        // Guard: binary files show a placeholder instead of raw bytes.
+        if !is_text_path(path) {
+            tracing::debug!(file = %path.display(), "binary file, showing placeholder");
+            self.editor = Editor::from_text("// Binary file — cannot display.\n// Open a source file from the sidebar.\n");
+            self.highlighter = None;
+            self.highlights = Highlights::default();
+            self.doc_dirty = false;
+            self.doc_version = 1;
+            self.scroll.jump_to(0.0);
+            self.h_scroll = 0.0;
+            self.ensure_visible = true;
+            self.current_path = Some(path.to_path_buf());
+            self.gutter_marks.clear();
+            self.diff_marks.clear();
+            self.hover_card = None;
+            self.hover_requested_for = None;
+            self.dismiss_completion();
+            return;
+        }
+
         match std::fs::read_to_string(path) {
             Ok(contents) => {
                 self.editor = Editor::from_text(&contents);
+                // Re-init syntax highlighter for the opened language.
+                let lang = language_for_path(path);
+                self.highlighter = match lang {
+                    Some("rust") => {
+                        match Highlighter::rust() {
+                            Ok(h) => Some(h),
+                            Err(e) => {
+                                tracing::warn!("rust highlighter: {e}");
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+                self.highlights = Highlights::default();
                 self.doc_dirty = true;
                 self.doc_version = 1;
                 self.scroll.jump_to(0.0);
+            self.h_scroll = 0.0;
                 self.ensure_visible = true;
                 self.current_path = Some(path.to_path_buf());
                 self.gutter_marks.clear();
@@ -1046,7 +1210,11 @@ impl App {
                 self.dismiss_completion();
                 self.lsp.open_document(path, &contents);
                 self.refresh_diff_marks();
-                tracing::info!(file = %path.display(), "opened");
+                tracing::info!(
+                    file = %path.display(),
+                    lang = lang.unwrap_or("plaintext"),
+                    "opened"
+                );
             }
             Err(err) => tracing::warn!(file = %path.display(), "could not open: {err}"),
         }
@@ -1227,6 +1395,27 @@ impl App {
             return true;
         }
 
+        // Click in the editor canvas → place caret at the clicked line/column.
+        if let (Some(chrome), Some(text)) = (&self.chrome, &self.text) {
+            let area = chrome.editor_rect();
+            if area.contains(point) {
+                let gutter_w = text.gutter_width(self.editor.buffer().len_lines());
+                let line = ((point.y - area.y0 + self.scroll.value()) / text.line_height())
+                    .floor()
+                    .max(0.0) as usize;
+                let line = line.min(self.editor.buffer().len_lines().saturating_sub(1));
+                let col = ((point.x - area.x0 - gutter_w) / text.advance())
+                    .floor()
+                    .max(0.0) as usize;
+                let line_len = self.editor.buffer().line_len(line);
+                let col = col.min(line_len);
+                let char_idx = self.editor.buffer().line_to_char(line) + col;
+                self.editor.set_caret(char_idx);
+                self.caret_phase = 0.0;
+                return true;
+            }
+        }
+
         let Some(idx) = self.tree_row_at(point) else { return false };
         let entry = &self.tree.entries()[idx];
         if entry.is_dir {
@@ -1362,6 +1551,10 @@ impl App {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f64();
         self.last_frame = now;
+        // Advance the caret pulse phase and keep animating while the window is focused.
+        if self.focused {
+            self.caret_phase = (self.caret_phase + dt / CARET_PERIOD) % 1.0;
+        }
         let chrome_moving = self.chrome.as_mut().is_some_and(|c| c.step(dt));
         let scroll_moving = self.scroll.step(dt);
 
@@ -1387,7 +1580,8 @@ impl App {
             || ghost_moving
             || hover_pending
             || search_streaming
-            || def_pending;
+            || def_pending
+            || self.focused; // caret pulse always drives frames while focused
 
         let caret_anchor = self.caret_anchor();
         let hover_card = self.hover_card.clone();
@@ -1420,6 +1614,18 @@ impl App {
 
         if let Some(chrome) = &mut self.chrome {
             chrome.paint(&mut self.scene);
+        }
+
+        // Tab bar: overlay the real filename over the tab strip background that
+        // Chrome just filled. Only shown when a file is open (current_path set).
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let label = self.current_path.as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_owned());
+            let tab_rect = chrome.tab_strip_rect();
+            let palette = chrome.palette();
+            text.paint_tab_bar(&mut self.scene, tab_rect, label.as_deref(), &palette, self.scale);
         }
 
         // Sidebar: either file tree or search panel.
@@ -1505,6 +1711,13 @@ impl App {
                     scroll_px: self.scroll.value(),
                     scale: self.scale,
                     show_caret: self.focused,
+                    caret_phase: self.caret_phase,
+                    h_scroll_px: self.h_scroll,
+                    h_scroll_fade: {
+                        let idle = self.h_scroll_last.elapsed().as_secs_f64();
+                        // Fade out linearly from 1.0 → 0.0 over 0.5 s after 1.5 s idle.
+                        (1.0 - (idle - 1.5).clamp(0.0, 0.5) / 0.5).max(0.0)
+                    },
                     gutter_marks: &gutter_marks,
                     diff_marks: &diff_marks,
                 },
@@ -1652,6 +1865,38 @@ impl App {
                     query: &cp.query,
                     entries: &entries,
                     selected: cp.selected,
+                },
+                &chrome.palette(),
+                self.scale,
+            );
+        }
+
+        // Settings panel (Ctrl+,) — painted above everything else.
+        if self.settings_open
+            && let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome)
+        {
+            let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+            let theme_names: Vec<&str> = (0..chrome.theme_count())
+                .map(|i| {
+                    // We can't call a per-index name getter easily; use the active name
+                    // and a placeholder for others. The cycle gesture changes the theme.
+                    if i == 0 { "Eden Day" } else if i == 1 { "Eden Dusk" } else { "Eden Noir" }
+                })
+                .collect();
+            let toggles = [
+                SettingsToggle { label: "Minimap", enabled: self.minimap_open },
+                SettingsToggle { label: "Time Scrubber", enabled: self.scrubber_open },
+                SettingsToggle { label: "Focus Halo", enabled: true },
+            ];
+            text.paint_settings(
+                &mut self.scene,
+                screen,
+                &SettingsView {
+                    font_size: self.settings.font_size,
+                    tab_width: self.settings.tab_width,
+                    themes: &theme_names,
+                    active_theme: chrome.active_theme_index(),
+                    toggles: &toggles,
                 },
                 &chrome.palette(),
                 self.scale,
@@ -1843,11 +2088,19 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let line_h = self.text.as_ref().map_or(20.0, TextSystem::line_height);
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => f64::from(y) * line_h * 3.0,
-                    MouseScrollDelta::PixelDelta(p) => p.y,
+                let advance = self.text.as_ref().map_or(8.0, TextSystem::advance);
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        (f64::from(x) * advance * 3.0, f64::from(y) * line_h * 3.0)
+                    }
+                    MouseScrollDelta::PixelDelta(p) => (p.x, p.y),
                 };
-                if self.over_sidebar() {
+                // Shift+scroll or natural horizontal scroll → horizontal offset.
+                if self.mods.shift_key() || dx.abs() > dy.abs() {
+                    let amount = if dx.abs() > dy.abs() { -dx } else { -dy };
+                    self.h_scroll = (self.h_scroll + amount).max(0.0);
+                    self.h_scroll_last = Instant::now();
+                } else if self.over_sidebar() {
                     self.tree_scroll = (self.tree_scroll - dy).max(0.0);
                 } else {
                     self.scroll.set_target(self.scroll.target() - dy);

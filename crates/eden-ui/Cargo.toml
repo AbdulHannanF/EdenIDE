@@ -18,4 +18,5 @@ eden-syntax.workspace = true
 eden-terminal.workspace = true
 eden-theme.workspace = true
 taffy = "0.10.1"
+tracing.workspace = true
 vello = "0.9.0"

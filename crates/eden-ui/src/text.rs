@@ -23,10 +23,9 @@ use crate::paint::{fill_rect, fill_rrect, to_color};
 // design: editor type at 14px logical, line height 1.55 (§6: "never compress").
 const FONT_SIZE: f64 = 14.0;
 const LINE_HEIGHT_FACTOR: f64 = 1.55;
-// design: the default editor font. Bundling JetBrains Mono (§6) is pending the
-// font asset; Consolas is a faithful monospace stand-in always present on
-// Windows. Family resolution is the only thing that needs to change.
-const EDITOR_FAMILY: Family<'static> = Family::Name("Consolas");
+// design: JetBrains Mono is loaded from assets/fonts/ at startup (see
+// TextSystem::load_jetbrains_mono); Consolas is the system fallback if the TTF
+// is missing. The family name is stored on TextSystem::editor_family.
 
 // design: diagnostic mark colours matching §5 Ambient Compile (rose / amber).
 const MARK_ERROR: Rgba8 = Rgba8::rgb(0xE5, 0x53, 0x4B);
@@ -67,6 +66,13 @@ pub struct EditorFrame<'a> {
     pub scale: f64,
     /// Whether to draw carets (typically: window focused).
     pub show_caret: bool,
+    /// Fractional phase [0, 1] driving the caret's sine-wave pulse. The caller
+    /// advances this each frame by `dt / CARET_PERIOD` and wraps at 1.0.
+    pub caret_phase: f64,
+    /// Horizontal scroll offset in physical pixels (0 = no scroll).
+    pub h_scroll_px: f64,
+    /// Opacity [0, 1] of the horizontal scrollbar (fades out after 1.5 s idle).
+    pub h_scroll_fade: f64,
     /// Gutter markers, as `(zero-indexed line, mark)` pairs.
     pub gutter_marks: &'a [(u32, GutterMark)],
     /// Diff gutter markers, as `(zero-indexed line, mark)` pairs.
@@ -208,13 +214,25 @@ pub struct TextSystem {
     font_size_px: f64,
     line_h: f64,
     advance: f64,
+    /// The family that was successfully loaded (JetBrains Mono or Consolas).
+    editor_family: &'static str,
 }
 
 impl TextSystem {
     /// Builds the text system for the given display scale.
+    ///
+    /// Tries to load JetBrains Mono from `assets/fonts/JetBrainsMono-Regular.ttf`
+    /// (found by walking up from the executable). Falls back to Consolas if the
+    /// TTF is missing or can't be loaded.
     #[must_use]
     pub fn new(scale: f64) -> Self {
         let mut font_system = FontSystem::new();
+        // Try to load the bundled JetBrains Mono font.
+        let editor_family = Self::load_jetbrains_mono(&mut font_system)
+            .unwrap_or_else(|| {
+                tracing::debug!("JetBrains Mono not found, falling back to Consolas");
+                "Consolas"
+            });
         let (font_size_px, line_h) = Self::metrics_for(scale);
         let metrics = Metrics::new(font_size_px as f32, line_h as f32);
         let text_buf = CtBuffer::new(&mut font_system, metrics);
@@ -228,9 +246,29 @@ impl TextSystem {
             font_size_px,
             line_h,
             advance: font_size_px * 0.6,
+            editor_family,
         };
         system.measure_advance();
         system
+    }
+
+    /// Attempts to register JetBrains Mono with the font system. Returns the
+    /// family name `"JetBrains Mono"` on success, `None` if not found.
+    fn load_jetbrains_mono(fs: &mut FontSystem) -> Option<&'static str> {
+        // Walk up from the executable to find the project root's assets/fonts/.
+        let exe = std::env::current_exe().ok()?;
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        while let Some(d) = dir {
+            let candidate = d.join("assets").join("fonts").join("JetBrainsMono-Regular.ttf");
+            if candidate.exists() {
+                let data = std::fs::read(&candidate).ok()?;
+                fs.db_mut().load_font_data(data);
+                tracing::info!("loaded JetBrains Mono from {}", candidate.display());
+                return Some("JetBrains Mono");
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+        None
     }
 
     /// The line height in physical pixels.
@@ -272,12 +310,14 @@ impl TextSystem {
     }
 
     fn measure_advance(&mut self) {
+        let family = Family::Name(self.editor_family);
         shape_buffer(
             &mut self.aux_buf,
             &mut self.font_system,
             "0000000000",
             None,
             self.line_h as f32,
+            family,
         );
         let width = self
             .aux_buf
@@ -319,6 +359,9 @@ impl TextSystem {
             scroll_px,
             scale,
             show_caret,
+            caret_phase,
+            h_scroll_px,
+            h_scroll_fade,
             gutter_marks,
             diff_marks,
         } = *frame;
@@ -458,12 +501,14 @@ impl TextSystem {
         let char_start = buffer.line_to_char(first_line);
         let char_end = buffer.line_to_char(last_line);
         let visible = buffer.slice_to_string(char_start..char_end);
+        let family = Family::Name(self.editor_family);
         shape_buffer(
             &mut self.text_buf,
             &mut self.font_system,
             &visible,
             None,
             (rows as f64 * line_h) as f32,
+            family,
         );
         let rope = buffer.rope();
         let total_chars = buffer.len_chars();
@@ -501,12 +546,14 @@ impl TextSystem {
             use std::fmt::Write as _;
             let _ = writeln!(numbers, "{:>width$}", line + 1, width = digits);
         }
+        let family = Family::Name(self.editor_family);
         shape_buffer(
             &mut self.aux_buf,
             &mut self.font_system,
             numbers.trim_end_matches('\n'),
             None,
             (rows as f64 * line_h) as f32,
+            family,
         );
         let number_color = with_alpha(palette.text_muted, 0xB0);
         let number_runs: Vec<RunData> = self
@@ -522,8 +569,39 @@ impl TextSystem {
             self.draw_glyphs(scene, &run.glyphs, number_x, origin_y + f64::from(run.line_y));
         }
 
-        // Carets on top.
+        // Horizontal scrollbar: 4 px tall, fades after 1.5 s idle, only when
+        // h_scroll_px > 0 and the content is actually wider than the viewport.
+        if h_scroll_px > 0.0 && h_scroll_fade > 0.01 {
+            let max_line_chars = (0..total_lines)
+                .map(|l| buffer.line_len(l))
+                .max()
+                .unwrap_or(0);
+            let content_w = max_line_chars as f64 * advance + gutter_w;
+            let view_w = area.width();
+            if content_w > view_w {
+                let bar_h = 4.0 * scale;
+                let bar_y = area.y1 - bar_h - 2.0 * scale;
+                let thumb_frac = (view_w / content_w).min(1.0);
+                let scroll_frac = (h_scroll_px / (content_w - view_w)).clamp(0.0, 1.0);
+                let track_w = view_w - gutter_w;
+                let thumb_w = (thumb_frac * track_w).max(20.0 * scale);
+                let thumb_x = area.x0 + gutter_w + scroll_frac * (track_w - thumb_w);
+                let alpha = (h_scroll_fade * 0xB0 as f64).round() as u8;
+                fill_rrect(
+                    scene,
+                    Rect::new(thumb_x, bar_y, thumb_x + thumb_w, bar_y + bar_h),
+                    bar_h / 2.0,
+                    with_alpha(palette.text_muted, alpha),
+                );
+            }
+        }
+
+        // Carets on top — sine-wave brightness pulse at ~1.1 s period (§7.6).
+        // alpha = 0.5 + 0.5 * sin(phase * 2π), giving a smooth 0..1 cycle.
         if show_caret {
+            let pulse = 0.55 + 0.45 * (caret_phase * std::f64::consts::TAU).sin();
+            let alpha = (pulse * 255.0).round().clamp(80.0, 255.0) as u8;
+            let caret_color = with_alpha(palette.accent, alpha);
             for sel in editor.selections() {
                 let line = buffer.char_to_line(sel.head);
                 if line < first_line || line >= last_line {
@@ -536,7 +614,7 @@ impl TextSystem {
                 fill_rect(
                     scene,
                     Rect::new(x, y + 2.0 * scale, x + caret_w, y + line_h - 2.0 * scale),
-                    palette.accent,
+                    caret_color,
                 );
             }
         }
@@ -624,6 +702,36 @@ impl TextSystem {
 
         scene.pop_layer();
         scroll
+    }
+
+    // ── tab bar ───────────────────────────────────────────────────────────
+
+    /// Paints the active-tab label (filename text + accent underline) over the
+    /// tab strip `area`. Does nothing if `label` is `None` (no file open).
+    ///
+    /// Called from the render loop *after* `Chrome::paint` so the tab strip
+    /// background is already filled; this layer adds the real filename text.
+    pub fn paint_tab_bar(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        label: Option<&str>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        let Some(label) = label else { return };
+        self.ensure_metrics(scale);
+        let tab_w = (200.0 * scale).max(120.0 * scale).min(area.width() * 0.5);
+        let tab = Rect::new(area.x0, area.y0, area.x0 + tab_w, area.y1);
+        // Active tab background.
+        fill_rect(scene, tab, palette.tab_active);
+        // 2 px accent underline at the bottom edge.
+        let uh = 2.0 * scale;
+        fill_rect(scene, Rect::new(tab.x0, tab.y1 - uh, tab.x1, tab.y1), palette.accent);
+        // Filename text with left padding, vertically centred.
+        let pad = 12.0 * scale;
+        let baseline = area.y0 + (area.height() + self.font_size_px) * 0.5;
+        self.draw_text(scene, label, tab.x0 + pad, baseline, with_alpha(palette.text, 0xE0));
     }
 
     // ── command palette ───────────────────────────────────────────────────
@@ -1064,6 +1172,73 @@ impl TextSystem {
         scene.pop_layer();
     }
 
+    // ── settings panel ───────────────────────────────────────────────────
+
+    /// Paints the `Ctrl+,` settings panel as a floating overlay over `screen`.
+    pub fn paint_settings(
+        &mut self,
+        scene: &mut Scene,
+        screen: Rect,
+        view: &SettingsView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        fill_rect(scene, screen, Rgba8::rgba(0, 0, 0, 0x4D));
+
+        let row_h = 32.0 * scale;
+        let pad = 20.0 * scale;
+        let width = (screen.width() * 0.5).clamp(340.0 * scale, 580.0 * scale);
+
+        // Rows: font size, tab width, themes, then each toggle.
+        let fixed_rows = 3usize;
+        let total_rows = fixed_rows + view.toggles.len();
+        let height = pad * 2.0 + row_h * total_rows as f64 + 8.0 * scale;
+        let x0 = screen.x0 + (screen.width() - width) / 2.0;
+        let y0 = screen.y0 + 70.0 * scale;
+        let panel = Rect::new(x0, y0, x0 + width, y0 + height);
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &panel);
+        fill_rrect(scene, panel, 12.0 * scale, palette.surface_raised);
+
+        // Title.
+        let title_baseline = y0 + pad * 0.8;
+        self.draw_text(scene, "Settings", x0 + pad, title_baseline, palette.accent);
+
+        let mut row_y = y0 + pad + 4.0 * scale;
+
+        // Font size row.
+        self.draw_text(scene, "Font size", x0 + pad, row_y + row_h * 0.68, with_alpha(palette.text_muted, 0xCC));
+        let val = format!("{} px", view.font_size);
+        self.draw_text(scene, &val, x0 + width - pad - 60.0 * scale, row_y + row_h * 0.68, palette.text);
+        row_y += row_h;
+
+        // Tab width row.
+        self.draw_text(scene, "Tab width", x0 + pad, row_y + row_h * 0.68, with_alpha(palette.text_muted, 0xCC));
+        let val = format!("{} spaces", view.tab_width);
+        self.draw_text(scene, &val, x0 + width - pad - 60.0 * scale, row_y + row_h * 0.68, palette.text);
+        row_y += row_h;
+
+        // Theme row.
+        self.draw_text(scene, "Theme", x0 + pad, row_y + row_h * 0.68, with_alpha(palette.text_muted, 0xCC));
+        let theme_name = view.themes.get(view.active_theme).copied().unwrap_or("—");
+        self.draw_text(scene, theme_name, x0 + width - pad - 120.0 * scale, row_y + row_h * 0.68, palette.accent);
+        row_y += row_h;
+
+        // Feature toggles.
+        for toggle in view.toggles {
+            let cy = row_y + row_h * 0.5;
+            let dot_r = 5.0 * scale;
+            let dot_x = x0 + width - pad - dot_r;
+            let dot_color = if toggle.enabled { palette.accent } else { with_alpha(palette.text_muted, 0x60) };
+            fill_rrect(scene, Rect::new(dot_x - dot_r, cy - dot_r, dot_x + dot_r, cy + dot_r), dot_r, dot_color);
+            self.draw_text(scene, toggle.label, x0 + pad, row_y + row_h * 0.68, with_alpha(palette.text, 0xDD));
+            row_y += row_h;
+        }
+
+        scene.pop_layer();
+    }
+
     // ── time scrubber ─────────────────────────────────────────────────────
 
     /// Paints a horizontal time-scrubber bar at the bottom-right of
@@ -1130,7 +1305,8 @@ impl TextSystem {
 
     /// Draws a single line of UI text with its baseline at `baseline`.
     pub fn draw_text(&mut self, scene: &mut Scene, text: &str, x: f64, baseline: f64, color: Rgba8) {
-        shape_buffer(&mut self.aux_buf, &mut self.font_system, text, None, self.line_h as f32);
+        let family = Family::Name(self.editor_family);
+        shape_buffer(&mut self.aux_buf, &mut self.font_system, text, None, self.line_h as f32, family);
         let runs: Vec<RunData> = self
             .aux_buf
             .layout_runs()
@@ -1192,8 +1368,9 @@ fn shape_buffer(
     text: &str,
     width: Option<f32>,
     height: f32,
+    family: Family<'_>,
 ) {
-    let attrs = Attrs::new().family(EDITOR_FAMILY);
+    let attrs = Attrs::new().family(family);
     buf.set_text(text, &attrs, Shaping::Advanced, None);
     buf.set_size(width, Some(height));
     buf.shape_until_scroll(fs, false);
@@ -1228,6 +1405,30 @@ pub struct MinimapView<'a> {
     pub syntax: &'a eden_theme::Syntax,
     /// Current vertical scroll in physical pixels.
     pub scroll_px: f64,
+}
+
+// ── settings ──────────────────────────────────────────────────────────────────
+
+/// One toggle row for the settings panel.
+pub struct SettingsToggle<'a> {
+    /// Display label.
+    pub label: &'a str,
+    /// Current on/off state.
+    pub enabled: bool,
+}
+
+/// Everything needed to render the settings panel.
+pub struct SettingsView<'a> {
+    /// Current font size (logical px).
+    pub font_size: u32,
+    /// Current tab width.
+    pub tab_width: u32,
+    /// Available theme names.
+    pub themes: &'a [&'a str],
+    /// Index of the active theme.
+    pub active_theme: usize,
+    /// Feature toggles.
+    pub toggles: &'a [SettingsToggle<'a>],
 }
 
 // ── scrubber ──────────────────────────────────────────────────────────────────

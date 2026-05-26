@@ -74,39 +74,15 @@ impl Widget for SidebarPanel {
     }
 }
 
-/// The tab strip: a few tab placeholders, the first one active.
+/// The tab strip: background only. Real tab labels (filename text, accent
+/// underline) are painted by [`crate::TextSystem::paint_tab_bar`] after
+/// `Chrome::paint` returns, so the text system can use cosmic-text.
 #[derive(Default)]
 pub struct TabStrip;
 
 impl Widget for TabStrip {
     fn paint(&self, scene: &mut Scene, bounds: Rect, ctx: &PaintCtx) {
-        let s = ctx.scale;
-        let p = ctx.palette;
-        fill_rect(scene, bounds, p.surface_raised);
-
-        let tab_w = (160.0 * s).min(bounds.width() / 3.0);
-        let labels = [124.0_f64, 96.0, 110.0];
-        for (i, label_w) in labels.iter().enumerate() {
-            let x0 = bounds.x0 + tab_w * i as f64;
-            let tab = Rect::new(x0, bounds.y0, x0 + tab_w, bounds.y1);
-            let active = i == 0;
-            if active {
-                fill_rect(scene, tab, p.tab_active);
-                // Accent underline.
-                let uh = 2.0 * s;
-                fill_rect(scene, Rect::new(tab.x0, tab.y1 - uh, tab.x1, tab.y1), p.accent);
-            } else if ctx.hover > 0.001 {
-                let alpha = (ctx.hover * f64::from(0x12)).round() as u8;
-                fill_rect(scene, tab, with_alpha(p.text, alpha));
-            }
-            let label_color = if active {
-                with_alpha(p.text, 0xE0)
-            } else {
-                with_alpha(p.text_muted, 0xC0)
-            };
-            let cy = bounds.center().y;
-            bar(scene, x0 + 16.0 * s, cy - 3.0 * s, label_w.min(tab_w - 40.0) * s, 6.0 * s, label_color);
-        }
+        fill_rect(scene, bounds, ctx.palette.surface_raised);
     }
 }
 
