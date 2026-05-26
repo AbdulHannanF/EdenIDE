@@ -1,30 +1,34 @@
 //! Eden — the application binary.
 //!
-//! Phase 0 ("Skeleton"): open a window via winit, bring up a wgpu device through
-//! vello's [`RenderContext`], and render a single rounded rectangle in the brand
-//! colour. This is the "hello, GPU" proof that the rendering spine is alive; the
-//! widget tree, motion system, and editor are layered on in later phases.
+//! Phase 1 ("The Surface"): the window now hosts the editor chrome — title bar,
+//! sidebar, tab strip, editor canvas, and status bar — laid out by taffy, drawn
+//! through vello, and themed. Motion is live: `B` toggles the sidebar (its width
+//! springs), `T` crossfades between the three built-in themes, and hovering the
+//! sidebar or tabs eases in a highlight. With `ControlFlow::Wait` the app idles
+//! at zero cost and only schedules frames while a spring is in motion.
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context as _, Result};
-use vello::kurbo::{Affine, RoundedRect};
-use vello::peniko::{Color, Fill};
+use eden_motion::MotionPrefs;
+use eden_ui::Chrome;
+use vello::kurbo::Point;
+use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-// design: Eden Day palette (§6). A warm paper-white field is the canvas; the
-// kingfisher-blue brand accent is the single shape. No neon, nothing above 75%
-// saturation — the same restraint the whole product is held to.
-const EDEN_DAY_PAPER: Color = Color::from_rgb8(0xFB, 0xF8, 0xF3);
-const EDEN_KINGFISHER: Color = Color::from_rgb8(0x2A, 0x6B, 0xC8);
+// design: the clear colour shows only on frames the scene doesn't fully cover
+// (it always does), so a neutral paper white matching the default Eden Day theme
+// avoids any first-frame flash.
+const CLEAR: Color = Color::from_rgb8(0xFB, 0xF8, 0xF3);
 
 fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -32,8 +36,6 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let event_loop = EventLoop::new().context("create event loop")?;
-    // design: Wait, not Poll. A static surface should idle at 0% CPU; later
-    // phases drive redraws explicitly from the motion system, not a busy loop.
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = App::new();
@@ -44,24 +46,20 @@ fn main() -> Result<()> {
 /// Top-level application state, driven by winit's [`ApplicationHandler`].
 struct App {
     context: RenderContext,
-    /// One renderer per wgpu device, indexed by `RenderSurface::dev_id`.
     renderers: Vec<Option<Renderer>>,
     state: WindowState,
     scene: Scene,
-    /// Captures the first fatal error so `main` can surface it after the loop.
+    chrome: Option<Chrome>,
+    prefs: MotionPrefs,
+    last_frame: Instant,
     fatal: Option<anyhow::Error>,
 }
 
-/// Whether a surface currently exists. winit may suspend/resume the app, so the
-/// renderable surface is created lazily in `resumed` and torn down on suspend.
 enum WindowState {
     Suspended,
-    // design: boxed to keep the enum small — `Active` is far larger than
-    // `Suspended`, which would otherwise trip `clippy::large_enum_variant`.
     Active(Box<ActiveWindow>),
 }
 
-/// A live window together with its configured render surface.
 struct ActiveWindow {
     window: Arc<Window>,
     surface: RenderSurface<'static>,
@@ -74,6 +72,9 @@ impl App {
             renderers: Vec::new(),
             state: WindowState::Suspended,
             scene: Scene::new(),
+            chrome: None,
+            prefs: MotionPrefs::from_env(),
+            last_frame: Instant::now(),
             fatal: None,
         }
     }
@@ -85,8 +86,6 @@ impl App {
         }
     }
 
-    /// Creates the window and its render surface. Separated out so the fallible
-    /// setup can use `?` and report a single error to `resumed`.
     fn activate(&mut self, event_loop: &ActiveEventLoop) -> Result<ActiveWindow> {
         let attributes = WindowAttributes::default()
             .with_title("Eden")
@@ -102,8 +101,6 @@ impl App {
             window.clone(),
             size.width.max(1),
             size.height.max(1),
-            // design: AutoVsync is the 60Hz floor; the 120Hz target on capable
-            // displays is a Phase 7 concern (present-mode negotiation).
             wgpu::PresentMode::AutoVsync,
         ))
         .context("create surface")?;
@@ -112,7 +109,6 @@ impl App {
         Ok(ActiveWindow { window, surface })
     }
 
-    /// Lazily builds a vello renderer for the given device if one is missing.
     fn ensure_renderer(&mut self, dev_id: usize) -> Result<()> {
         if self.renderers.len() <= dev_id {
             self.renderers.resize_with(dev_id + 1, || None);
@@ -123,10 +119,8 @@ impl App {
                 device,
                 RendererOptions {
                     use_cpu: false,
-                    // design: we only ever request `AaConfig::Area`, so compile
-                    // just that pipeline permutation and keep startup lean (§9).
                     antialiasing_support: AaSupport::area_only(),
-                    num_init_threads: NonZeroUsize::new(1),
+                    num_init_threads: std::num::NonZeroUsize::new(1),
                     pipeline_cache: None,
                 },
             )
@@ -136,17 +130,54 @@ impl App {
         Ok(())
     }
 
-    fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        if let WindowState::Active(active) = &mut self.state {
-            self.context.resize_surface(&mut active.surface, width, height);
+    fn request_redraw(&self) {
+        if let WindowState::Active(active) = &self.state {
             active.window.request_redraw();
         }
     }
 
+    fn resize(&mut self, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let WindowState::Active(active) = &mut self.state else {
+            return;
+        };
+        self.context.resize_surface(&mut active.surface, width, height);
+        let scale = active.window.scale_factor();
+        if let Some(chrome) = &mut self.chrome {
+            chrome.resize(f64::from(width), f64::from(height), scale);
+        }
+        active.window.request_redraw();
+    }
+
+    /// Handles a key press. Returns `true` if it changed anything visible.
+    fn on_key(&mut self, code: KeyCode) -> bool {
+        let Some(chrome) = &mut self.chrome else {
+            return false;
+        };
+        match code {
+            KeyCode::KeyB => {
+                chrome.toggle_sidebar();
+                true
+            }
+            KeyCode::KeyT => {
+                let next = chrome.active_theme_name().to_owned();
+                chrome.cycle_theme();
+                tracing::info!(from = %next, to = %chrome.active_theme_name(), "theme cycled");
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn render(&mut self) -> Result<()> {
+        // Advance animations by the real elapsed time since the last frame.
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame).as_secs_f64();
+        self.last_frame = now;
+        let animating = self.chrome.as_mut().is_some_and(|c| c.step(dt));
+
         let WindowState::Active(active) = &mut self.state else {
             return Ok(());
         };
@@ -154,8 +185,6 @@ impl App {
         let height = active.surface.config.height;
         let dev_id = active.surface.dev_id;
 
-        // wgpu 29 returns a status enum rather than a `Result`. Skip transient
-        // frames; reconfigure and retry on the recoverable surface-loss cases.
         use wgpu::CurrentSurfaceTexture as Acquired;
         let surface_texture = match active.surface.surface.get_current_texture() {
             Acquired::Success(texture) | Acquired::Suboptimal(texture) => texture,
@@ -169,7 +198,9 @@ impl App {
         };
 
         self.scene.reset();
-        draw_brand_mark(&mut self.scene, f64::from(width), f64::from(height));
+        if let Some(chrome) = &mut self.chrome {
+            chrome.paint(&mut self.scene);
+        }
 
         let device_handle = &self.context.devices[dev_id];
         let renderer = self.renderers[dev_id]
@@ -183,7 +214,7 @@ impl App {
                 &self.scene,
                 &active.surface.target_view,
                 &RenderParams {
-                    base_color: EDEN_DAY_PAPER,
+                    base_color: CLEAR,
                     width,
                     height,
                     antialiasing_method: AaConfig::Area,
@@ -191,7 +222,6 @@ impl App {
             )
             .map_err(|e| anyhow::anyhow!("vello render: {e:?}"))?;
 
-        // vello renders to a storage texture; blit it onto the swapchain image.
         let mut encoder =
             device_handle
                 .device
@@ -213,10 +243,14 @@ impl App {
         device_handle.queue.submit([encoder.finish()]);
         active.window.pre_present_notify();
         surface_texture.present();
+
+        // Keep the frame loop alive only while something is still moving.
+        if animating {
+            active.window.request_redraw();
+        }
         Ok(())
     }
 
-    /// Records the first fatal error and asks the loop to exit cleanly.
     fn fail(&mut self, event_loop: &ActiveEventLoop, err: anyhow::Error) {
         tracing::error!("{err:#}");
         if self.fatal.is_none() {
@@ -231,18 +265,31 @@ impl ApplicationHandler for App {
         if matches!(self.state, WindowState::Active(_)) {
             return;
         }
-        match self.activate(event_loop) {
-            Ok(active) => {
-                active.window.request_redraw();
-                self.state = WindowState::Active(Box::new(active));
+        let active = match self.activate(event_loop) {
+            Ok(active) => active,
+            Err(err) => return self.fail(event_loop, err),
+        };
+
+        if self.chrome.is_none() {
+            let size = active.window.inner_size();
+            let scale = active.window.scale_factor();
+            match Chrome::new(
+                f64::from(size.width.max(1)),
+                f64::from(size.height.max(1)),
+                scale,
+                self.prefs,
+            ) {
+                Ok(chrome) => self.chrome = Some(chrome),
+                Err(err) => return self.fail(event_loop, anyhow::anyhow!("build chrome: {err}")),
             }
-            Err(err) => self.fail(event_loop, err),
         }
+
+        self.last_frame = Instant::now();
+        active.window.request_redraw();
+        self.state = WindowState::Active(Box::new(active));
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        // Drop the surface (and its window) but keep renderers — the device
-        // outlives a suspend/resume cycle, so we can rebuild a surface cheaply.
         self.state = WindowState::Suspended;
     }
 
@@ -255,6 +302,33 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.set_hover(Some(Point::new(position.x, position.y)));
+                }
+                self.request_redraw();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.set_hover(None);
+                }
+                self.request_redraw();
+            }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        physical_key: PhysicalKey::Code(code),
+                        state: ElementState::Pressed,
+                        repeat: false,
+                        ..
+                    },
+                ..
+            } => {
+                let changed = self.on_key(code);
+                if changed {
+                    self.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 if let Err(err) = self.render() {
                     self.fail(event_loop, err);
@@ -263,15 +337,4 @@ impl ApplicationHandler for App {
             _ => {}
         }
     }
-}
-
-/// Draws the Phase 0 brand mark: a single rounded rectangle in kingfisher blue,
-/// inset from the edges of a paper-white field.
-fn draw_brand_mark(scene: &mut Scene, width: f64, height: f64) {
-    // design: corner radius 16, the top of the §6 radius scale (4/8/12/16).
-    // The inset scales with the smaller dimension so the mark stays centred and
-    // proportional as the window resizes, clamped to sane bounds.
-    let inset = (width.min(height) * 0.18).clamp(24.0, 160.0);
-    let rect = RoundedRect::new(inset, inset, width - inset, height - inset, 16.0);
-    scene.fill(Fill::NonZero, Affine::IDENTITY, EDEN_KINGFISHER, None, &rect);
 }

@@ -4,10 +4,13 @@ A desktop code editor written in pure Rust, rendered on the GPU. Eden aims for
 the seam between Zed's raw performance, Linear's design discipline, Raycast's
 command-driven ergonomics, and the quiet confidence of native macOS apps.
 
-> **Status: Phase 0 — Skeleton.** A winit window comes up, a wgpu device is
-> initialised through vello, and a single rounded rectangle is rendered in the
-> brand colour. The crate boundaries for the full product are in place; each is
-> filled in over the phased build plan below.
+> **Status: Phase 1 — The Surface.** The window hosts the themed editor chrome
+> (title bar, sidebar, tab strip, editor canvas, status bar), laid out with
+> taffy and drawn through vello. Motion is live and spring-driven: `B` toggles
+> the sidebar (its width springs open/closed), `T` crossfades between the three
+> built-in themes, and hovering the sidebar or tabs eases in a highlight. The
+> frame loop idles at zero cost and only schedules frames while a spring moves.
+> Set `EDEN_REDUCE_MOTION=1` to shorten (not remove) transitions.
 
 ## Architecture
 

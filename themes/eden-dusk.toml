@@ -1,0 +1,16 @@
+# Eden Dusk — desaturated navy, off-white text, muted teal/rose accents.
+name = "Eden Dusk"
+appearance = "dark"
+
+[palette]
+background = "#1A1F2E"
+surface = "#151A26"
+surface_raised = "#1F2535"
+status_bar = "#12161F"
+text = "#E6E4DC"
+text_muted = "#8A8E9A"
+divider = "#E6E4DC12"
+accent = "#3E9C92"
+accent_soft = "#C77B86"
+tab_active = "#1A1F2E"
+selection = "#3E9C922E"

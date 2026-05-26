@@ -1,4 +1,16 @@
 //! `eden-ui` — widget tree, layout, render passes, and theming.
 //!
-//! Stub scaffolded in Phase 0; fleshed out in Phase 1 (the widget trait, taffy
-//! layout, dirty-region invalidation, hit testing, and the themed editor chrome).
+//! Phase 1 establishes the surface: a [`Widget`] trait whose implementors are
+//! pure painters, a taffy-driven [`Chrome`] that lays the editor shell out and
+//! animates it with springs, hit testing, and paint helpers over vello's
+//! `Scene`. Text, the editor buffer, and real content arrive in later phases.
+
+mod chrome;
+mod paint;
+mod panels;
+mod widget;
+
+pub use chrome::{Chrome, Region};
+pub use paint::{fill_rect, fill_rrect, to_color};
+pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TitleBar};
+pub use widget::{PaintCtx, Widget};

@@ -1,0 +1,16 @@
+# Eden Noir — near-black, high contrast, a single molten-gold accent.
+name = "Eden Noir"
+appearance = "dark"
+
+[palette]
+background = "#0E0E10"
+surface = "#0B0B0D"
+surface_raised = "#141417"
+status_bar = "#0A0A0C"
+text = "#EDEDEA"
+text_muted = "#7A7A80"
+divider = "#EDEDEA10"
+accent = "#D9A441"
+accent_soft = "#B8862F"
+tab_active = "#0E0E10"
+selection = "#D9A44126"
