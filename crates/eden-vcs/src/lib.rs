@@ -98,6 +98,18 @@ impl GitRepo {
         self.repo.workdir().unwrap_or_else(|| self.repo.path())
     }
 
+    /// The current branch name, or a short commit hash when HEAD is detached.
+    /// Returns `None` only if the repository has no commits.
+    #[must_use]
+    pub fn branch_name(&self) -> Option<String> {
+        let head = self.repo.head().ok()?;
+        if head.is_branch() {
+            head.shorthand().map(|s| s.to_owned())
+        } else {
+            head.target().map(|oid| oid.to_string()[..7].to_owned())
+        }
+    }
+
     // ── status ─────────────────────────────────────────────────────────────
 
     /// Returns VCS status for all modified/untracked files in the working tree.

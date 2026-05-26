@@ -99,6 +99,8 @@ pub struct TreeView<'a> {
     pub scroll_px: f64,
     /// The row index under the cursor, if any.
     pub hovered: Option<usize>,
+    /// The row index of the currently open file, if visible.
+    pub selected: Option<usize>,
 }
 
 /// The command-palette content to render.
@@ -281,6 +283,13 @@ impl TextSystem {
     #[must_use]
     pub fn advance(&self) -> f64 {
         self.advance
+    }
+
+    /// The fixed row height used by the sidebar file tree, in physical pixels.
+    /// This is independent of the editor line height — always 24 logical px.
+    #[must_use]
+    pub fn sidebar_row_height(&self) -> f64 {
+        24.0 * self.scale
     }
 
     /// The gutter width for a buffer with `total_lines` lines, in physical px.
@@ -638,8 +647,11 @@ impl TextSystem {
         let rows = view.rows;
         let scroll_px = view.scroll_px;
         let hovered = view.hovered;
+        let selected = view.selected;
         self.ensure_metrics(scale);
-        let row_h = self.line_h;
+        // design: sidebar rows use a fixed 24px logical height for touch-target
+        // clarity — independent of the editor line height.
+        let row_h = 24.0 * scale;
 
         let max_scroll = (rows.len() as f64 * row_h - area.height()).max(0.0);
         let scroll = scroll_px.clamp(0.0, max_scroll);
@@ -653,51 +665,62 @@ impl TextSystem {
 
         for (i, row) in rows.iter().enumerate().take(last).skip(first) {
             let top = area.y0 - frac + (i - first) as f64 * row_h;
-            if hovered == Some(i) {
+
+            // Selected file: accent tint + 2px left border.
+            if selected == Some(i) {
                 fill_rect(
                     scene,
                     Rect::new(area.x0, top, area.x1, top + row_h),
-                    with_alpha(palette.accent, 0x16),
+                    with_alpha(palette.accent, 0x18),
+                );
+                fill_rect(
+                    scene,
+                    Rect::new(area.x0, top, area.x0 + 2.0 * scale, top + row_h),
+                    palette.accent,
+                );
+            } else if hovered == Some(i) {
+                fill_rect(
+                    scene,
+                    Rect::new(area.x0, top, area.x1, top + row_h),
+                    with_alpha(palette.accent, 0x12),
                 );
             }
-            let indent = area.x0 + 10.0 * scale + row.depth as f64 * 14.0 * scale;
-            let marker = 7.0 * scale;
-            let my = top + row_h * 0.5 - marker / 2.0;
+
+            // design: 16px depth indentation, 8px left base padding.
+            let indent = area.x0 + 8.0 * scale + row.depth as f64 * 16.0 * scale;
+            let baseline = top + row_h * 0.72;
+
             if row.is_dir {
-                let color = if row.expanded {
+                // Chevron: "▼" when expanded, "▶" when collapsed.
+                let ch = if row.expanded { "▼" } else { "▶" };
+                let ch_color = if row.expanded {
+                    with_alpha(palette.accent, 0xCC)
+                } else {
+                    with_alpha(palette.text_muted, 0xA0)
+                };
+                self.draw_text(scene, ch, indent, baseline, ch_color);
+                let name_color = palette.text;
+                let name_x = indent + self.advance + 6.0 * scale;
+                self.draw_text(scene, row.name, name_x, baseline, name_color);
+            } else {
+                // Files: small dot + name, indented past chevron space.
+                let dot = 4.0 * scale;
+                let dot_x = indent + (self.advance - dot) * 0.5;
+                let dot_y = top + (row_h - dot) * 0.5;
+                fill_rrect(
+                    scene,
+                    Rect::new(dot_x, dot_y, dot_x + dot, dot_y + dot),
+                    dot / 2.0,
+                    with_alpha(palette.text_muted, 0x60),
+                );
+                let name_x = indent + self.advance + 6.0 * scale;
+                let name_color = if selected == Some(i) {
                     palette.accent
                 } else {
-                    with_alpha(palette.text_muted, 0xC0)
+                    with_alpha(palette.text, 0xCC)
                 };
-                fill_rrect(
-                    scene,
-                    Rect::new(indent, my, indent + marker, my + marker),
-                    2.0 * scale,
-                    color,
-                );
-            } else {
-                let dot = marker * 0.55;
-                let dy = top + row_h * 0.5 - dot / 2.0;
-                fill_rrect(
-                    scene,
-                    Rect::new(
-                        indent + (marker - dot) / 2.0,
-                        dy,
-                        indent + (marker + dot) / 2.0,
-                        dy + dot,
-                    ),
-                    dot / 2.0,
-                    with_alpha(palette.text_muted, 0x80),
-                );
+                self.draw_text(scene, row.name, name_x, baseline, name_color);
             }
-            let name_x = indent + marker + 8.0 * scale;
-            let baseline = top + row_h * 0.7;
-            let color = if row.is_dir {
-                palette.text
-            } else {
-                with_alpha(palette.text, 0xDD)
-            };
-            self.draw_text(scene, row.name, name_x, baseline, color);
         }
 
         scene.pop_layer();
@@ -1301,6 +1324,52 @@ impl TextSystem {
         Some(bar)
     }
 
+    // ── status bar ────────────────────────────────────────────────────────
+
+    /// Paints real text over the status bar: branch name on the left, language
+    /// and cursor position on the right. Called after `Chrome::paint` so the
+    /// bar background is already filled.
+    pub fn paint_status_bar(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &StatusBarView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        let baseline = area.y0 + (area.height() + self.font_size_px * 0.72) * 0.5;
+        let muted = with_alpha(palette.text_muted, 0xCC);
+
+        // Left: accent dot + branch name.
+        let mut x = area.x0 + 10.0 * scale;
+        if let Some(branch) = view.branch {
+            let dot = 6.0 * scale;
+            let dot_y = area.y0 + (area.height() - dot) * 0.5;
+            fill_rrect(
+                scene,
+                Rect::new(x, dot_y, x + dot, dot_y + dot),
+                dot / 2.0,
+                palette.accent,
+            );
+            x += dot + 5.0 * scale;
+            self.draw_text(scene, branch, x, baseline, muted);
+        }
+
+        // Right: "Ln N, Col N" — estimated advance for right-alignment.
+        let pos_text = format!("Ln {}, Col {}", view.line, view.col);
+        let pos_w = pos_text.len() as f64 * self.advance;
+        let pos_x = area.x1 - pos_w - 12.0 * scale;
+        self.draw_text(scene, &pos_text, pos_x, baseline, muted);
+
+        // Language — to the left of the position text.
+        if let Some(lang) = view.language {
+            let lang_w = lang.len() as f64 * self.advance;
+            let lang_x = pos_x - lang_w - 16.0 * scale;
+            self.draw_text(scene, lang, lang_x, baseline, muted);
+        }
+    }
+
     // ── shared drawing helpers ────────────────────────────────────────────
 
     /// Draws a single line of UI text with its baseline at `baseline`.
@@ -1429,6 +1498,20 @@ pub struct SettingsView<'a> {
     pub active_theme: usize,
     /// Feature toggles.
     pub toggles: &'a [SettingsToggle<'a>],
+}
+
+// ── status bar ────────────────────────────────────────────────────────────────
+
+/// Everything needed to render the status bar for one frame.
+pub struct StatusBarView<'a> {
+    /// Git branch name, or `None` if not in a repo.
+    pub branch: Option<&'a str>,
+    /// Language mode for the active file (e.g. `"Rust"`), or `None`.
+    pub language: Option<&'a str>,
+    /// 1-based line number of the primary caret.
+    pub line: usize,
+    /// 1-based column number of the primary caret.
+    pub col: usize,
 }
 
 // ── scrubber ──────────────────────────────────────────────────────────────────

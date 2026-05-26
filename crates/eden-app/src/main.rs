@@ -27,8 +27,8 @@ use eden_theme::Rgba8;
 use eden_ui::{
     Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
     EditorFrame, GutterMark, Highlighter, Highlights, MinimapView, PaletteView, SearchPanelView,
-    SearchRowView, ScrubberView, SettingsToggle, SettingsView, TerminalView, TextSystem, TreeRow,
-    TreeView, fill_rrect,
+    SearchRowView, ScrubberView, SettingsToggle, SettingsView, StatusBarView, TerminalView,
+    TextSystem, TreeRow, TreeView, fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -51,24 +51,6 @@ const HOVER_DELAY: Duration = Duration::from_millis(400);
 
 /// Full period of the caret's sine-wave brightness pulse (§7.6).
 const CARET_PERIOD: f64 = 1.1;
-
-const SAMPLE: &str = "// Eden — Phase 6: Signature Features.\n\
-//\n\
-// Ctrl+M             toggle semantic minimap\n\
-// Ctrl+Shift+H       toggle time scrubber\n\
-// Ctrl+Shift+P       command palette (try typing \"show files\" or \"undo\")\n\
-// Ambient Compile    bloom behind diagnostic lines when rust-analyzer is running\n\
-// Focus Halo         sidebar dims while you type, breathes back on hover\n\
-// Choreographed Diff ghost caret appears when F12 jumps to a definition\n\
-\n\
-fn main() {\n\
-    let greeting = \"hello, eden\";\n\
-    let mut total = 0u64;\n\
-    for (i, ch) in greeting.char_indices() {\n\
-        total += (i as u64) * (ch as u64);\n\
-    }\n\
-    println!(\"{greeting}: {total}\");\n\
-}\n";
 
 // ── project root helpers ──────────────────────────────────────────────────────
 
@@ -486,8 +468,8 @@ impl App {
             scene: Scene::new(),
             chrome: None,
             text: None,
-            editor: Editor::from_text(SAMPLE),
-            highlighter: Highlighter::rust().ok(),
+            editor: Editor::from_text("// Welcome to Eden\n"),
+            highlighter: None,
             highlights: Highlights::default(),
             doc_dirty: true,
             project,
@@ -1360,7 +1342,7 @@ impl App {
         if rect.width() < 2.0 || !rect.contains(point) {
             return None;
         }
-        let row_h = text.line_height();
+        let row_h = text.sidebar_row_height();
         let idx = ((point.y - rect.y0 + self.tree_scroll) / row_h).floor();
         if idx < 0.0 {
             return None;
@@ -1628,6 +1610,32 @@ impl App {
             text.paint_tab_bar(&mut self.scene, tab_rect, label.as_deref(), &palette, self.scale);
         }
 
+        // Status bar: real branch, language, and cursor position text.
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let status_rect = chrome.status_bar_rect();
+            let palette = chrome.palette();
+            let branch = self.git.as_ref().and_then(|g| g.branch_name());
+            let lang = self.current_path.as_ref()
+                .and_then(|p| language_for_path(p))
+                .map(str::to_uppercase);
+            let caret = self.editor.primary();
+            let line = self.editor.buffer().char_to_line(caret.head) + 1;
+            let line_start = self.editor.buffer().line_to_char(line.saturating_sub(1));
+            let col = caret.head.saturating_sub(line_start) + 1;
+            text.paint_status_bar(
+                &mut self.scene,
+                status_rect,
+                &StatusBarView {
+                    branch: branch.as_deref(),
+                    language: lang.as_deref(),
+                    line,
+                    col,
+                },
+                &palette,
+                self.scale,
+            );
+        }
+
         // Sidebar: either file tree or search panel.
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let rect = chrome.sidebar_rect();
@@ -1670,6 +1678,9 @@ impl App {
                         self.scale,
                     );
                 } else {
+                    let selected_row = self.current_path.as_ref().and_then(|p| {
+                        self.tree.entries().iter().position(|e| e.path == *p)
+                    });
                     let rows: Vec<TreeRow<'_>> = self
                         .tree
                         .entries()
@@ -1688,6 +1699,7 @@ impl App {
                             rows: &rows,
                             scroll_px: self.tree_scroll,
                             hovered: self.tree_hover,
+                            selected: selected_row,
                         },
                         &palette,
                         self.scale,
@@ -2028,6 +2040,18 @@ impl ApplicationHandler for App {
         }
         if self.text.is_none() {
             self.text = Some(TextSystem::new(self.scale));
+        }
+        // Open startup file on first launch — prefer crates/eden-app/src/main.rs
+        // relative to the workspace root; fall back to empty welcome buffer.
+        if self.current_path.is_none() {
+            let startup = self.project.root()
+                .join("crates")
+                .join("eden-app")
+                .join("src")
+                .join("main.rs");
+            if startup.exists() {
+                self.open_path(&startup);
+            }
         }
         self.last_frame = Instant::now();
         active.window.request_redraw();

@@ -371,6 +371,12 @@ impl Chrome {
         self.region_rect(Region::Terminal)
     }
 
+    /// The absolute rect of the status bar.
+    #[must_use]
+    pub fn status_bar_rect(&self) -> Rect {
+        self.region_rect(Region::StatusBar)
+    }
+
     fn region_rect(&self, want: Region) -> Rect {
         self.regions()
             .into_iter()

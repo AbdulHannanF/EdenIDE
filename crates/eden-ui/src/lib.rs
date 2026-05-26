@@ -17,7 +17,7 @@ pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TerminalPanel, T
 pub use text::{
     CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, EditorFrame, GutterMark,
     MinimapView, PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle,
-    SettingsView, TerminalView, TextSystem, TreeRow, TreeView,
+    SettingsView, StatusBarView, TerminalView, TextSystem, TreeRow, TreeView,
 };
 pub use paint::to_rgba8_alpha;
 pub use widget::{PaintCtx, Widget};
