@@ -12,6 +12,7 @@ use cosmic_text::fontdb;
 use cosmic_text::{Attrs, Buffer as CtBuffer, Family, FontSystem, Metrics, Shaping, Weight};
 use eden_editor::Editor;
 use eden_syntax::{HighlightKind, Highlights};
+use eden_terminal::{TermCell, resolve_color};
 use eden_theme::{Palette, Rgba8, Syntax};
 use vello::kurbo::{Affine, Point, Rect};
 use vello::peniko::{Blob, Fill, FontData};
@@ -30,6 +31,10 @@ const EDITOR_FAMILY: Family<'static> = Family::Name("Consolas");
 // design: diagnostic mark colours matching §5 Ambient Compile (rose / amber).
 const MARK_ERROR: Rgba8 = Rgba8::rgb(0xE5, 0x53, 0x4B);
 const MARK_WARN: Rgba8 = Rgba8::rgb(0xC7, 0x7B, 0x2C);
+// design: diff mark colours: green added, amber modified, rose deleted.
+const MARK_ADDED: Rgba8 = Rgba8::rgb(0x3C, 0xB3, 0x71);
+const MARK_MODIFIED: Rgba8 = Rgba8::rgb(0xC7, 0x7B, 0x2C);
+const MARK_DELETED: Rgba8 = Rgba8::rgb(0xE5, 0x53, 0x4B);
 
 // ── gutter mark ───────────────────────────────────────────────────────────────
 
@@ -64,6 +69,8 @@ pub struct EditorFrame<'a> {
     pub show_caret: bool,
     /// Gutter markers, as `(zero-indexed line, mark)` pairs.
     pub gutter_marks: &'a [(u32, GutterMark)],
+    /// Diff gutter markers, as `(zero-indexed line, mark)` pairs.
+    pub diff_marks: &'a [(u32, DiffMark)],
 }
 
 /// One row of the sidebar file tree to render.
@@ -96,6 +103,79 @@ pub struct PaletteView<'a> {
     pub entries: &'a [String],
     /// The index of the highlighted row.
     pub selected: usize,
+}
+
+/// A gutter diff marker kind (distinct from LSP diagnostic marks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffMark {
+    /// Lines were added.
+    Added,
+    /// Lines were modified.
+    Modified,
+    /// Lines were deleted at this row.
+    Deleted,
+}
+
+/// One result row in the search panel.
+pub struct SearchRowView {
+    /// File path (relative).
+    pub path: String,
+    /// 1-based line number.
+    pub line_no: u64,
+    /// The matched line text.
+    pub line: String,
+    /// Byte offset of match start within `line`.
+    pub match_start: usize,
+    /// Byte offset of match end within `line`.
+    pub match_end: usize,
+}
+
+/// The project search panel content.
+pub struct SearchPanelView<'a> {
+    /// Current query string.
+    pub query: &'a str,
+    /// Whether the query uses regex.
+    pub is_regex: bool,
+    /// Whether the match is case-sensitive.
+    pub case_sensitive: bool,
+    /// Whether the match is whole-word.
+    pub whole_word: bool,
+    /// Result rows to display.
+    pub rows: &'a [SearchRowView],
+    /// Selected result index.
+    pub selected: usize,
+}
+
+/// One entry in the command palette.
+pub struct CmdEntry {
+    /// Display label.
+    pub label: String,
+    /// Keyboard shortcut hint, if any.
+    pub shortcut: Option<String>,
+}
+
+/// The command palette overlay content.
+pub struct CmdPaletteView<'a> {
+    /// Current query.
+    pub query: &'a str,
+    /// Filtered command entries (already ranked).
+    pub entries: &'a [CmdEntry],
+    /// Selected entry index.
+    pub selected: usize,
+}
+
+/// The terminal grid view for one frame.
+pub struct TerminalView<'a> {
+    /// Terminal cell grid, row-major.
+    pub rows: &'a [&'a [TermCell]],
+    /// Number of columns.
+    pub cols: usize,
+    /// Cursor row (0-indexed).
+    pub cursor_row: usize,
+    /// Cursor column (0-indexed).
+    pub cursor_col: usize,
+    /// Whether the terminal is focused (show cursor).
+    pub focused: bool,
 }
 
 /// A single item in the completion popup.
@@ -240,6 +320,7 @@ impl TextSystem {
             scale,
             show_caret,
             gutter_marks,
+            diff_marks,
         } = *frame;
         self.ensure_metrics(scale);
         let buffer = editor.buffer();
@@ -286,6 +367,39 @@ impl TextSystem {
                 mark_sz / 2.0,
                 color,
             );
+        }
+
+        // Diff markers: coloured vertical bars at the right edge of the gutter.
+        let diff_bar_w = 3.0 * scale;
+        let diff_bar_x = text_x - diff_bar_w - scale;
+        for &(mark_line, ref mark) in diff_marks.iter() {
+            let ml = mark_line as usize;
+            if ml < first_line || ml >= last_line {
+                continue;
+            }
+            let y = row_top(ml);
+            let color = match mark {
+                DiffMark::Added => MARK_ADDED,
+                DiffMark::Modified => MARK_MODIFIED,
+                DiffMark::Deleted => MARK_DELETED,
+            };
+            if *mark == DiffMark::Deleted {
+                // Small triangle pointing right at the deletion point.
+                let tri_sz = 5.0 * scale;
+                fill_rrect(
+                    scene,
+                    Rect::new(diff_bar_x, y + line_h / 2.0 - 1.0 * scale, diff_bar_x + tri_sz, y + line_h / 2.0 + 1.0 * scale),
+                    1.0 * scale,
+                    color,
+                );
+            } else {
+                fill_rrect(
+                    scene,
+                    Rect::new(diff_bar_x, y + 1.0 * scale, diff_bar_x + diff_bar_w, y + line_h - 1.0 * scale),
+                    diff_bar_w / 2.0,
+                    color,
+                );
+            }
         }
 
         // Selection highlights, behind the text.
@@ -661,6 +775,197 @@ impl TextSystem {
                 let detail_x = x0 + width - pad_x - detail.len() as f64 * self.advance * 0.6;
                 if detail_x > x0 + width * 0.5 {
                     self.draw_text(scene, detail, detail_x, row_top + row_h * 0.7, detail_color);
+                }
+            }
+        }
+
+        scene.pop_layer();
+    }
+
+    // ── project search panel ──────────────────────────────────────────────
+
+    /// Paints the project-search sidebar panel inside `area`.
+    pub fn paint_search_panel(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &SearchPanelView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        let row_h = self.line_h;
+        let pad = 10.0 * scale;
+        let query_h = 40.0 * scale;
+        let toggle_h = 28.0 * scale;
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &area);
+        fill_rect(scene, area, palette.surface);
+
+        // Query box.
+        let query_rect = Rect::new(area.x0 + pad / 2.0, area.y0 + 6.0 * scale, area.x1 - pad / 2.0, area.y0 + 6.0 * scale + query_h);
+        fill_rrect(scene, query_rect, 6.0 * scale, palette.background);
+        let prompt = if view.query.is_empty() { "Search…" } else { view.query };
+        let prompt_color = if view.query.is_empty() {
+            with_alpha(palette.text_muted, 0xC0)
+        } else {
+            palette.text
+        };
+        self.draw_text(scene, prompt, query_rect.x0 + 8.0 * scale, query_rect.y0 + query_h * 0.66, prompt_color);
+
+        // Toggle row: Aa (case) [.*] (regex) \b (word).
+        let ty = query_rect.y1 + 4.0 * scale;
+        let toggles = [
+            ("Aa", view.case_sensitive),
+            (".*", view.is_regex),
+            ("\\b", view.whole_word),
+        ];
+        let btn_w = 28.0 * scale;
+        let mut tx = area.x0 + pad / 2.0;
+        for (label, active) in &toggles {
+            let btn = Rect::new(tx, ty, tx + btn_w, ty + toggle_h);
+            if *active {
+                fill_rrect(scene, btn, 4.0 * scale, palette.accent);
+                self.draw_text(scene, label, tx + 4.0 * scale, ty + toggle_h * 0.7, palette.background);
+            } else {
+                fill_rrect(scene, btn, 4.0 * scale, with_alpha(palette.text_muted, 0x30));
+                self.draw_text(scene, label, tx + 4.0 * scale, ty + toggle_h * 0.7, with_alpha(palette.text_muted, 0xC0));
+            }
+            tx += btn_w + 4.0 * scale;
+        }
+
+        // Divider.
+        let list_y0 = ty + toggle_h + 6.0 * scale;
+        fill_rect(scene, Rect::new(area.x0, list_y0, area.x1, list_y0 + scale.max(1.0)), palette.divider);
+        let list_top = list_y0 + scale.max(1.0);
+
+        // Result rows.
+        let shown = ((area.height() - (list_top - area.y0)) / row_h).ceil() as usize + 1;
+        for (i, row) in view.rows.iter().take(shown).enumerate() {
+            let row_top = list_top + i as f64 * row_h;
+            if row_top + row_h > area.y1 {
+                break;
+            }
+            if i == view.selected {
+                fill_rect(scene, Rect::new(area.x0, row_top, area.x1, row_top + row_h), palette.selection);
+            }
+            // File + line number on the left.
+            let label = format!("{}:{}", row.path, row.line_no);
+            let label_color = if i == view.selected { palette.accent } else { with_alpha(palette.accent, 0xCC) };
+            self.draw_text(scene, &label, area.x0 + pad, row_top + row_h * 0.35, label_color);
+            // Line content below.
+            let line_color = if i == view.selected { palette.text } else { with_alpha(palette.text, 0xCC) };
+            let line_preview: String = row.line.chars().take(60).collect();
+            self.draw_text(scene, &line_preview, area.x0 + pad, row_top + row_h * 0.78, line_color);
+        }
+
+        scene.pop_layer();
+    }
+
+    // ── command palette ───────────────────────────────────────────────────
+
+    /// Paints the Ctrl+Shift+P command palette as a floating overlay.
+    pub fn paint_cmd_palette(
+        &mut self,
+        scene: &mut Scene,
+        screen: Rect,
+        view: &CmdPaletteView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        fill_rect(scene, screen, Rgba8::rgba(0, 0, 0, 0x4D));
+
+        let row_h = 36.0 * scale;
+        let query_h = 48.0 * scale;
+        let max_rows = 10usize;
+        let shown = view.entries.len().min(max_rows);
+
+        let width = (screen.width() * 0.55).clamp(380.0 * scale, 720.0 * scale);
+        let height = query_h + shown as f64 * row_h + 12.0 * scale;
+        let x0 = screen.x0 + (screen.width() - width) / 2.0;
+        let y0 = screen.y0 + 80.0 * scale;
+        let panel = Rect::new(x0, y0, x0 + width, y0 + height);
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &panel);
+        fill_rrect(scene, panel, 12.0 * scale, palette.surface_raised);
+
+        let pad = 18.0 * scale;
+        let prompt = if view.query.is_empty() { "Run command…" } else { view.query };
+        let prompt_color = if view.query.is_empty() {
+            with_alpha(palette.text_muted, 0xC0)
+        } else {
+            palette.text
+        };
+        self.draw_text(scene, prompt, x0 + pad, y0 + query_h * 0.64, prompt_color);
+
+        let div = scale.max(1.0);
+        fill_rect(scene, Rect::new(x0, y0 + query_h, x0 + width, y0 + query_h + div), palette.divider);
+
+        for (i, entry) in view.entries.iter().take(shown).enumerate() {
+            let row_top = y0 + query_h + i as f64 * row_h;
+            if i == view.selected {
+                fill_rect(scene, Rect::new(x0, row_top, x0 + width, row_top + row_h), palette.selection);
+            }
+            let color = if i == view.selected { palette.text } else { with_alpha(palette.text, 0xCC) };
+            self.draw_text(scene, &entry.label, x0 + pad, row_top + row_h * 0.66, color);
+            if let Some(ref sc) = entry.shortcut {
+                let sc_color = with_alpha(palette.accent, 0xCC);
+                let sc_x = x0 + width - pad - sc.len() as f64 * self.advance * 0.9;
+                if sc_x > x0 + width * 0.5 {
+                    self.draw_text(scene, sc, sc_x, row_top + row_h * 0.66, sc_color);
+                }
+            }
+        }
+
+        scene.pop_layer();
+    }
+
+    // ── terminal ──────────────────────────────────────────────────────────
+
+    /// Paints the terminal cell grid into `area`.
+    pub fn paint_terminal(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &TerminalView<'_>,
+        scale: f64,
+    ) {
+        if area.height() < 2.0 || area.width() < 2.0 {
+            return;
+        }
+        self.ensure_metrics(scale);
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &area);
+
+        let bg_default = Rgba8::rgb(0x1E, 0x1E, 0x1E);
+        fill_rect(scene, area, bg_default);
+
+        let cell_w = self.advance;
+        let cell_h = self.line_h;
+
+        for (r, row_cells) in view.rows.iter().enumerate() {
+            let y0 = area.y0 + r as f64 * cell_h;
+            if y0 > area.y1 {
+                break;
+            }
+            for (c, cell) in row_cells.iter().enumerate() {
+                let x0 = area.x0 + c as f64 * cell_w;
+                if x0 > area.x1 {
+                    break;
+                }
+                // Background.
+                let bg = resolve_color(cell.bg, false);
+                if bg != bg_default {
+                    fill_rect(scene, Rect::new(x0, y0, x0 + cell_w, y0 + cell_h), bg);
+                }
+                // Cursor block.
+                if view.focused && r == view.cursor_row && c == view.cursor_col {
+                    fill_rect(scene, Rect::new(x0, y0, x0 + cell_w, y0 + cell_h), with_alpha(Rgba8::rgb(0xFF, 0xFF, 0xFF), 0x55));
+                }
+                // Glyph.
+                if cell.ch != ' ' {
+                    let fg = resolve_color(cell.fg, true);
+                    self.draw_text(scene, &cell.ch.to_string(), x0, y0 + cell_h * 0.78, fg);
                 }
             }
         }

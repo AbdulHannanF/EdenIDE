@@ -1,29 +1,31 @@
 //! Eden — the application binary.
 //!
-//! Phase 4 ("Intelligence"): `eden-lsp` connects to `rust-analyzer` (when
-//! installed), surfaces diagnostics as gutter markers, shows a hover card when
-//! the cursor is still for 400 ms, and opens a completion popup on Ctrl+Space.
+//! Phase 5 ("Surroundings"): project-wide content search, command palette,
+//! embedded terminal, and git gutter diff markers.
 //!
 //! Controls:
-//!   Ctrl+B — toggle sidebar    Ctrl+T — cycle theme
-//!   Ctrl+Z / Ctrl+Y — undo / redo    Ctrl+A — select all
-//!   Ctrl+P — Cmd-P fuzzy file open    Ctrl+Space — completions
-//!   F12 — go-to-definition (opens result file in editor)
-//!
-//! (LSP features are silently no-ops when rust-analyzer is not installed.)
+//!   Ctrl+B — toggle sidebar         Ctrl+T — cycle theme
+//!   Ctrl+Z / Ctrl+Y — undo / redo   Ctrl+A — select all
+//!   Ctrl+P — Cmd-P fuzzy file open  Ctrl+Space — completions
+//!   Ctrl+Shift+F — project search   Ctrl+Shift+P — command palette
+//!   Ctrl+\` — toggle terminal       F12 — go-to-definition
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use crossbeam_channel::Receiver;
 use eden_lsp::{CompletionItem, LspPool, Position as LspPos, Severity};
 use eden_motion::{MotionPrefs, Spring, SpringConfig};
-use eden_search::FuzzyMatcher;
+use eden_search::{FuzzyMatcher, SearchHit, SearchQuery, search_project};
+use eden_terminal::TerminalBackend;
 use eden_ui::{
-    Chrome, CompletionEntry, CompletionView, Editor, EditorFrame, GutterMark, Highlighter,
-    Highlights, PaletteView, TextSystem, TreeRow, TreeView,
+    Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
+    EditorFrame, GutterMark, Highlighter, Highlights, PaletteView, SearchPanelView, SearchRowView,
+    TerminalView, TextSystem, TreeRow, TreeView,
 };
+use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
 use vello::kurbo::{Point, Rect};
 use vello::peniko::Color;
@@ -42,10 +44,12 @@ const CLEAR: Color = Color::from_rgb8(0xFB, 0xF8, 0xF3);
 /// Cursor must be still for this long before a hover request is fired.
 const HOVER_DELAY: Duration = Duration::from_millis(400);
 
-const SAMPLE: &str = "// Eden — Phase 4: LSP intelligence.\n\
+const SAMPLE: &str = "// Eden — Phase 5: Surroundings.\n\
 //\n\
-// Ctrl+Space for completions. Hold the cursor still for hover.\n\
-// Diagnostics appear as dots in the gutter.\n\
+// Ctrl+Shift+F  project search\n\
+// Ctrl+Shift+P  command palette\n\
+// Ctrl+`        toggle terminal\n\
+// Git diff markers appear in the gutter when a file is opened from git repo.\n\
 \n\
 fn main() {\n\
     let greeting = \"hello, eden\";\n\
@@ -67,6 +71,108 @@ fn main() -> Result<()> {
     let mut app = App::new();
     event_loop.run_app(&mut app).context("run event loop")?;
     app.into_result()
+}
+
+// ── command roster ────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandId {
+    ToggleSidebar,
+    CycleTheme,
+    OpenFilePalette,
+    ProjectSearch,
+    CommandPalette,
+    ToggleTerminal,
+    Undo,
+    Redo,
+    SelectAll,
+    GoToDefinition,
+    TriggerCompletions,
+}
+
+struct Command {
+    id: CommandId,
+    label: &'static str,
+    shortcut: Option<&'static str>,
+}
+
+fn built_in_commands() -> Vec<Command> {
+    vec![
+        Command { id: CommandId::ToggleSidebar,      label: "Toggle Sidebar",         shortcut: Some("Ctrl+B") },
+        Command { id: CommandId::CycleTheme,          label: "Cycle Theme",             shortcut: Some("Ctrl+T") },
+        Command { id: CommandId::OpenFilePalette,     label: "Open File…",              shortcut: Some("Ctrl+P") },
+        Command { id: CommandId::ProjectSearch,       label: "Project Search",          shortcut: Some("Ctrl+Shift+F") },
+        Command { id: CommandId::ToggleTerminal,      label: "Toggle Terminal",         shortcut: Some("Ctrl+`") },
+        Command { id: CommandId::Undo,                label: "Undo",                    shortcut: Some("Ctrl+Z") },
+        Command { id: CommandId::Redo,                label: "Redo",                    shortcut: Some("Ctrl+Y") },
+        Command { id: CommandId::SelectAll,           label: "Select All",              shortcut: Some("Ctrl+A") },
+        Command { id: CommandId::GoToDefinition,      label: "Go to Definition",        shortcut: Some("F12") },
+        Command { id: CommandId::TriggerCompletions,  label: "Trigger Completions",     shortcut: Some("Ctrl+Space") },
+        Command { id: CommandId::CommandPalette,      label: "Open Command Palette",    shortcut: Some("Ctrl+Shift+P") },
+    ]
+}
+
+// ── modal states ──────────────────────────────────────────────────────────────
+
+struct PaletteState {
+    query: String,
+    results: Vec<usize>,
+    selected: usize,
+}
+
+struct SearchState {
+    query: String,
+    case_sensitive: bool,
+    whole_word: bool,
+    is_regex: bool,
+    rx: Option<Receiver<SearchHit>>,
+    hits: Vec<SearchHit>,
+    selected: usize,
+}
+
+impl SearchState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            case_sensitive: false,
+            whole_word: false,
+            is_regex: false,
+            rx: None,
+            hits: Vec::new(),
+            selected: 0,
+        }
+    }
+}
+
+struct CmdPaletteState {
+    query: String,
+    commands: Vec<Command>,
+    filtered: Vec<usize>,
+    selected: usize,
+}
+
+impl CmdPaletteState {
+    fn new() -> Self {
+        let commands = built_in_commands();
+        let filtered: Vec<usize> = (0..commands.len()).collect();
+        Self { query: String::new(), commands, filtered, selected: 0 }
+    }
+
+    fn refilter(&mut self) {
+        let q = self.query.to_lowercase();
+        if q.is_empty() {
+            self.filtered = (0..self.commands.len()).collect();
+        } else {
+            self.filtered = self
+                .commands
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.label.to_lowercase().contains(&q))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        self.selected = 0;
+    }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -108,6 +214,20 @@ struct App {
     completion_selected: usize,
     completion_items: Vec<CompletionItem>,
 
+    // Phase 5: project search
+    search_open: bool,
+    search: SearchState,
+
+    // Phase 5: command palette
+    cmd_palette: Option<CmdPaletteState>,
+
+    // Phase 5: terminal
+    terminal: Option<TerminalBackend>,
+
+    // Phase 5: git diff
+    git: Option<GitRepo>,
+    diff_marks: Vec<(u32, DiffMark)>,
+
     cursor: Option<Point>,
     scroll: Spring,
     prefs: MotionPrefs,
@@ -124,12 +244,6 @@ enum WindowState {
     Active(Box<ActiveWindow>),
 }
 
-struct PaletteState {
-    query: String,
-    results: Vec<usize>,
-    selected: usize,
-}
-
 struct ActiveWindow {
     window: Arc<Window>,
     surface: RenderSurface<'static>,
@@ -142,6 +256,7 @@ impl App {
         let files = project.file_strings();
         let tree = FileTree::new(project.root());
         let lsp = LspPool::new(&root);
+        let git = GitRepo::discover(&root).ok();
         Self {
             context: RenderContext::new(),
             renderers: Vec::new(),
@@ -170,6 +285,12 @@ impl App {
             completion_open: false,
             completion_selected: 0,
             completion_items: Vec::new(),
+            search_open: false,
+            search: SearchState::new(),
+            cmd_palette: None,
+            terminal: None,
+            git,
+            diff_marks: Vec::new(),
             cursor: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             prefs: MotionPrefs::from_env(),
@@ -247,19 +368,42 @@ impl App {
         if let Some(chrome) = &mut self.chrome {
             chrome.resize(f64::from(width), f64::from(height), self.scale);
         }
+        // Resize terminal if open.
+        if let (Some(term), Some(chrome), Some(text)) =
+            (&mut self.terminal, &self.chrome, &self.text)
+        {
+            let rect = chrome.terminal_rect();
+            let cols = (rect.width() / text.advance()).floor() as usize;
+            let rows = (rect.height() / text.line_height()).floor() as usize;
+            if cols > 0 && rows > 0 {
+                term.resize(cols, rows);
+            }
+        }
         active.window.request_redraw();
     }
 
     // ── keyboard ──────────────────────────────────────────────────────────
 
     fn on_key(&mut self, event: &KeyEvent) -> bool {
+        // Route to the terminal first if it has focus.
+        if self.terminal.is_some()
+            && self.chrome.as_ref().is_some_and(|c| c.terminal_open())
+            && self.on_terminal_key(event)
+        {
+            return true;
+        }
+
+        if let Some(ref mut _cp) = self.cmd_palette {
+            return self.on_cmd_palette_key(event);
+        }
         if self.palette.is_some() {
             return self.on_palette_key(event);
         }
-        if self.completion_open {
-            if self.on_completion_key(event) {
-                return true;
-            }
+        if self.search_open && self.on_search_key(event) {
+            return true;
+        }
+        if self.completion_open && self.on_completion_key(event) {
+            return true;
         }
         let ctrl = self.mods.control_key() || self.mods.super_key();
         let shift = self.mods.shift_key();
@@ -269,7 +413,7 @@ impl App {
                 true
             }
             Key::Named(named) => self.on_named_key(*named, shift),
-            Key::Character(s) if ctrl => self.on_command(s),
+            Key::Character(s) if ctrl => self.on_command(s, shift),
             Key::Character(s) => {
                 self.editor.insert(s);
                 self.doc_dirty = true;
@@ -299,12 +443,34 @@ impl App {
                     self.dismiss_completion();
                     return true;
                 }
+                if self.search_open {
+                    self.search_open = false;
+                    return true;
+                }
                 false
             }
             NamedKey::ArrowLeft => self.edit(false, |e| e.move_left(shift)),
             NamedKey::ArrowRight => self.edit(false, |e| e.move_right(shift)),
-            NamedKey::ArrowUp => self.edit(false, |e| e.move_up(shift)),
-            NamedKey::ArrowDown => self.edit(false, |e| e.move_down(shift)),
+            NamedKey::ArrowUp => {
+                if self.search_open {
+                    let count = self.search.hits.len();
+                    if count > 0 {
+                        self.search.selected = (self.search.selected + count - 1) % count;
+                    }
+                    return true;
+                }
+                self.edit(false, |e| e.move_up(shift))
+            }
+            NamedKey::ArrowDown => {
+                if self.search_open {
+                    let count = self.search.hits.len();
+                    if count > 0 {
+                        self.search.selected = (self.search.selected + 1) % count;
+                    }
+                    return true;
+                }
+                self.edit(false, |e| e.move_down(shift))
+            }
             NamedKey::Home => self.edit(false, |e| e.move_line_start(shift)),
             NamedKey::End => self.edit(false, |e| e.move_line_end(shift)),
             NamedKey::PageUp => {
@@ -319,37 +485,289 @@ impl App {
         }
     }
 
-    fn on_command(&mut self, key: &str) -> bool {
-        match key {
-            "b" | "B" => {
+    fn on_command(&mut self, key: &str, shift: bool) -> bool {
+        match (key, shift) {
+            ("b" | "B", false) => {
                 if let Some(chrome) = &mut self.chrome {
                     chrome.toggle_sidebar();
                 }
                 true
             }
-            "t" | "T" => {
+            ("t" | "T", false) => {
                 if let Some(chrome) = &mut self.chrome {
                     chrome.cycle_theme();
                 }
                 true
             }
-            "z" | "Z" => self.edit(true, |e| {
+            ("z" | "Z", false) => self.edit(true, |e| {
                 e.undo();
             }),
-            "y" | "Y" => self.edit(true, |e| {
+            ("y" | "Y", false) => self.edit(true, |e| {
                 e.redo();
             }),
-            "a" | "A" => self.edit(false, Editor::select_all),
-            "p" | "P" => {
+            ("a" | "A", false) => self.edit(false, Editor::select_all),
+            ("p" | "P", false) => {
                 self.open_palette();
                 true
             }
-            " " => {
-                // Ctrl+Space → completions
+            ("p" | "P", true) => {
+                // Ctrl+Shift+P → command palette
+                self.open_cmd_palette();
+                true
+            }
+            ("f" | "F", true) => {
+                // Ctrl+Shift+F → project search
+                self.search_open = !self.search_open;
+                true
+            }
+            (" ", false) => {
                 self.trigger_completions();
                 true
             }
+            ("`", false) => {
+                // Ctrl+` → toggle terminal
+                self.toggle_terminal();
+                true
+            }
             _ => false,
+        }
+    }
+
+    // ── terminal ──────────────────────────────────────────────────────────
+
+    fn toggle_terminal(&mut self) {
+        if let Some(chrome) = &mut self.chrome {
+            chrome.toggle_terminal();
+            if chrome.terminal_open() && self.terminal.is_none() {
+                let (cols, rows) = self.terminal_dimensions();
+                match TerminalBackend::spawn(cols.max(20), rows.max(4)) {
+                    Ok(t) => self.terminal = Some(t),
+                    Err(err) => tracing::warn!("terminal spawn failed: {err:#}"),
+                }
+            }
+        }
+    }
+
+    fn terminal_dimensions(&self) -> (usize, usize) {
+        let Some(chrome) = &self.chrome else { return (80, 24) };
+        let Some(text) = &self.text else { return (80, 24) };
+        let rect = chrome.terminal_rect();
+        let cols = (rect.width() / text.advance()).floor() as usize;
+        let rows = (rect.height() / text.line_height()).floor() as usize;
+        (cols.max(1), rows.max(1))
+    }
+
+    fn on_terminal_key(&mut self, event: &KeyEvent) -> bool {
+        // Only handle keys that aren't Ctrl+` (which toggles the terminal).
+        let ctrl = self.mods.control_key();
+        if ctrl && let Key::Character(s) = &event.logical_key {
+            if s == "`" {
+                return false; // let the main handler toggle
+            }
+            // Send Ctrl+key as ASCII control code.
+            if let Some(c) = s.chars().next() {
+                let code = (c as u8).wrapping_sub(b'a').wrapping_add(1);
+                if let Some(term) = &mut self.terminal {
+                    term.write(&[code]);
+                }
+                return true;
+            }
+        }
+        let bytes: Option<&[u8]> = match &event.logical_key {
+            Key::Named(NamedKey::Enter) => Some(b"\r"),
+            Key::Named(NamedKey::Backspace) => Some(b"\x7f"),
+            Key::Named(NamedKey::Delete) => Some(b"\x1b[3~"),
+            Key::Named(NamedKey::Escape) => Some(b"\x1b"),
+            Key::Named(NamedKey::Tab) => Some(b"\t"),
+            Key::Named(NamedKey::ArrowUp) => Some(b"\x1b[A"),
+            Key::Named(NamedKey::ArrowDown) => Some(b"\x1b[B"),
+            Key::Named(NamedKey::ArrowRight) => Some(b"\x1b[C"),
+            Key::Named(NamedKey::ArrowLeft) => Some(b"\x1b[D"),
+            Key::Named(NamedKey::Home) => Some(b"\x1b[H"),
+            Key::Named(NamedKey::End) => Some(b"\x1b[F"),
+            Key::Character(s) if !ctrl => {
+                if let Some(term) = &mut self.terminal {
+                    term.write_str(s);
+                }
+                return true;
+            }
+            _ => None,
+        };
+        if let (Some(bytes), Some(term)) = (bytes, &mut self.terminal) {
+            term.write(bytes);
+            return true;
+        }
+        false
+    }
+
+    // ── project search ────────────────────────────────────────────────────
+
+    fn on_search_key(&mut self, event: &KeyEvent) -> bool {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.search_open = false;
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.open_search_result();
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.search.query.pop();
+                self.start_search();
+                true
+            }
+            Key::Character(s) => {
+                let ctrl = self.mods.control_key();
+                let shift = self.mods.shift_key();
+                if ctrl {
+                    match (s.as_str(), shift) {
+                        // Ctrl+I → toggle case sensitive
+                        ("i" | "I", false) => {
+                            self.search.case_sensitive = !self.search.case_sensitive;
+                            self.start_search();
+                        }
+                        // Ctrl+R → toggle regex
+                        ("r" | "R", false) => {
+                            self.search.is_regex = !self.search.is_regex;
+                            self.start_search();
+                        }
+                        // Ctrl+W → toggle whole word
+                        ("w" | "W", false) => {
+                            self.search.whole_word = !self.search.whole_word;
+                            self.start_search();
+                        }
+                        _ => return false,
+                    }
+                } else {
+                    self.search.query.push_str(s);
+                    self.start_search();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn start_search(&mut self) {
+        self.search.hits.clear();
+        self.search.selected = 0;
+        self.search.rx = None;
+        if self.search.query.is_empty() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let query = SearchQuery {
+            text: self.search.query.clone(),
+            case_sensitive: self.search.case_sensitive,
+            whole_word: self.search.whole_word,
+            is_regex: self.search.is_regex,
+        };
+        search_project(self.project.root(), query, tx);
+        self.search.rx = Some(rx);
+    }
+
+    fn open_search_result(&mut self) {
+        let hit = self.search.hits.get(self.search.selected).cloned();
+        let Some(hit) = hit else { return };
+        self.open_path(&hit.path);
+        let line = (hit.line_no as usize).saturating_sub(1);
+        let char_idx = self.editor.buffer().line_to_char(line);
+        self.editor.set_caret(char_idx);
+        self.ensure_visible = true;
+    }
+
+    // ── command palette ───────────────────────────────────────────────────
+
+    fn open_cmd_palette(&mut self) {
+        self.cmd_palette = Some(CmdPaletteState::new());
+    }
+
+    fn on_cmd_palette_key(&mut self, event: &KeyEvent) -> bool {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.cmd_palette = None;
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.execute_selected_command();
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(cp) = &mut self.cmd_palette {
+                    let count = cp.filtered.len();
+                    if count > 0 {
+                        cp.selected = (cp.selected + 1) % count;
+                    }
+                }
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if let Some(cp) = &mut self.cmd_palette {
+                    let count = cp.filtered.len();
+                    if count > 0 {
+                        cp.selected = (cp.selected + count - 1) % count;
+                    }
+                }
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(cp) = &mut self.cmd_palette {
+                    cp.query.pop();
+                    cp.refilter();
+                }
+                true
+            }
+            Key::Character(s) => {
+                if let Some(cp) = &mut self.cmd_palette {
+                    cp.query.push_str(s);
+                    cp.refilter();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn execute_selected_command(&mut self) {
+        let Some(cp) = &self.cmd_palette else { return };
+        let cmd_id = cp
+            .filtered
+            .get(cp.selected)
+            .and_then(|&i| cp.commands.get(i))
+            .map(|c| c.id);
+        self.cmd_palette = None;
+        let Some(id) = cmd_id else { return };
+        match id {
+            CommandId::ToggleSidebar => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.toggle_sidebar();
+                }
+            }
+            CommandId::CycleTheme => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.cycle_theme();
+                }
+            }
+            CommandId::OpenFilePalette => self.open_palette(),
+            CommandId::ProjectSearch => {
+                self.search_open = true;
+            }
+            CommandId::CommandPalette => self.open_cmd_palette(),
+            CommandId::ToggleTerminal => self.toggle_terminal(),
+            CommandId::Undo => {
+                self.editor.undo();
+                self.doc_dirty = true;
+            }
+            CommandId::Redo => {
+                self.editor.redo();
+                self.doc_dirty = true;
+            }
+            CommandId::SelectAll => {
+                self.editor.select_all();
+            }
+            CommandId::GoToDefinition => self.go_to_definition(),
+            CommandId::TriggerCompletions => self.trigger_completions(),
         }
     }
 
@@ -393,7 +811,6 @@ impl App {
         let item = self.completion_items.get(self.completion_selected).cloned();
         self.dismiss_completion();
         let Some(item) = item else { return };
-        // Delete the current word before the caret, then insert.
         let insert = item.insert_text.clone();
         self.editor.insert(&insert);
         self.doc_dirty = true;
@@ -495,10 +912,12 @@ impl App {
                 self.ensure_visible = true;
                 self.current_path = Some(path.to_path_buf());
                 self.gutter_marks.clear();
+                self.diff_marks.clear();
                 self.hover_card = None;
                 self.hover_requested_for = None;
                 self.dismiss_completion();
                 self.lsp.open_document(path, &contents);
+                self.refresh_diff_marks();
                 tracing::info!(file = %path.display(), "opened");
             }
             Err(err) => tracing::warn!(file = %path.display(), "could not open: {err}"),
@@ -508,14 +927,34 @@ impl App {
     fn go_to_definition(&mut self) {
         let Some(path) = self.current_path.clone() else { return };
         let Some(pos) = self.caret_lsp_position() else { return };
-        // Fire-and-forget; the result currently just logs (Phase 4 follow-up:
-        // show a picker and open the file).
         self.lsp.request_definition_logged(&path, pos);
+    }
+
+    // ── git diff marks ────────────────────────────────────────────────────
+
+    fn refresh_diff_marks(&mut self) {
+        let Some(path) = &self.current_path.clone() else { return };
+        let Some(git) = &self.git else { return };
+        match git.diff_hunks(path) {
+            Ok(hunks) => {
+                self.diff_marks = hunks
+                    .iter()
+                    .flat_map(|h| {
+                        let kind = match h.kind {
+                            DiffKind::Added => DiffMark::Added,
+                            DiffKind::Modified => DiffMark::Modified,
+                            DiffKind::Deleted => DiffMark::Deleted,
+                        };
+                        (h.start_line..=h.end_line).map(move |line| (line, kind))
+                    })
+                    .collect();
+            }
+            Err(err) => tracing::debug!("diff_hunks: {err:#}"),
+        }
     }
 
     // ── LSP helpers ───────────────────────────────────────────────────────
 
-    /// Returns the LSP position of the primary caret.
     fn caret_lsp_position(&self) -> Option<LspPos> {
         let caret = self.editor.primary();
         let line = self.editor.buffer().char_to_line(caret.head) as u32;
@@ -524,8 +963,6 @@ impl App {
         Some(LspPos { line, character })
     }
 
-    /// Returns the physical-pixel LSP position for the cursor, clamped to the
-    /// editor area.
     fn cursor_lsp_position(&self) -> Option<LspPos> {
         let cursor = self.cursor?;
         let chrome = self.chrome.as_ref()?;
@@ -542,7 +979,6 @@ impl App {
         Some(LspPos { line, character })
     }
 
-    /// Converts LSP diagnostics to gutter marks for the current file.
     fn refresh_gutter_marks(&mut self) {
         let Some(path) = &self.current_path.clone() else { return };
         let diags = self.lsp.diagnostics(path);
@@ -558,14 +994,13 @@ impl App {
             .collect();
     }
 
-    /// Fires hover after the cursor has been still for [`HOVER_DELAY`].
     fn maybe_request_hover(&mut self) {
         if self.cursor_still_since.elapsed() < HOVER_DELAY {
             return;
         }
         let cursor = self.cursor;
         if self.hover_requested_for == cursor {
-            return; // already requested for this position
+            return;
         }
         let Some(path) = &self.current_path.clone() else { return };
         let Some(pos) = self.cursor_lsp_position() else { return };
@@ -573,13 +1008,11 @@ impl App {
         self.hover_requested_for = cursor;
     }
 
-    /// Pulls the latest hover card from the LSP, if any.
     fn refresh_hover(&mut self) {
         let Some(path) = &self.current_path.clone() else { return };
         self.hover_card = self.lsp.hover(path).map(|h| h.contents);
     }
 
-    /// Physical-pixel coordinates of the caret (top-left of the glyph cell).
     fn caret_anchor(&self) -> Option<Point> {
         let text = self.text.as_ref()?;
         let chrome = self.chrome.as_ref()?;
@@ -648,7 +1081,6 @@ impl App {
             return;
         }
         self.doc_dirty = false;
-        // Notify the LSP of the change.
         if let Some(path) = &self.current_path.clone() {
             self.doc_version += 1;
             let text = self.editor.buffer().to_string();
@@ -707,12 +1139,18 @@ impl App {
         self.clamp_scroll();
         self.ensure_caret_visible();
 
-        // LSP: pull diagnostics + hover on every frame (cheap reads from shared state).
         self.refresh_gutter_marks();
         self.maybe_request_hover();
         self.refresh_hover();
 
-        // Pull fresh completions if popup is open.
+        // Drain search results from the background thread.
+        if let Some(rx) = &self.search.rx {
+            while let Ok(hit) = rx.try_recv() {
+                self.search.hits.push(hit);
+            }
+        }
+
+        // Pull fresh completions.
         if self.completion_open {
             let items = self
                 .current_path
@@ -730,19 +1168,18 @@ impl App {
         let chrome_moving = self.chrome.as_mut().is_some_and(|c| c.step(dt));
         let scroll_moving = self.scroll.step(dt);
 
-        // Re-request a frame if hover delay hasn't elapsed yet (so the hover
-        // fires at the right moment without the user moving the mouse).
         let hover_pending = self.hover_requested_for != self.cursor
             && self.cursor_still_since.elapsed() < HOVER_DELAY;
-        let animating = chrome_moving || scroll_moving || hover_pending;
+        let search_streaming = self.search.rx.is_some() && self.search_open;
+        let animating = chrome_moving || scroll_moving || hover_pending || search_streaming;
 
-        // Pre-compute values that need &self before the &mut self.state borrow.
         let caret_anchor = self.caret_anchor();
         let hover_card = self.hover_card.clone();
         let completion_items: Vec<_> = self.completion_items.clone();
         let completion_selected = self.completion_selected;
         let completion_open = self.completion_open;
         let gutter_marks: Vec<_> = self.gutter_marks.clone();
+        let diff_marks: Vec<_> = self.diff_marks.clone();
 
         let WindowState::Active(active) = &mut self.state else {
             return Ok(());
@@ -769,37 +1206,75 @@ impl App {
             chrome.paint(&mut self.scene);
         }
 
-        // Sidebar file tree.
+        // Sidebar: either file tree or search panel.
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let rect = chrome.sidebar_rect();
             if rect.width() > 2.0 {
                 let palette = chrome.palette();
-                let rows: Vec<TreeRow<'_>> = self
-                    .tree
-                    .entries()
-                    .iter()
-                    .map(|e| TreeRow {
-                        name: &e.name,
-                        depth: e.depth,
-                        is_dir: e.is_dir,
-                        expanded: e.expanded,
-                    })
-                    .collect();
-                self.tree_scroll = text.paint_file_tree(
-                    &mut self.scene,
-                    rect,
-                    &TreeView {
-                        rows: &rows,
-                        scroll_px: self.tree_scroll,
-                        hovered: self.tree_hover,
-                    },
-                    &palette,
-                    self.scale,
-                );
+                if self.search_open {
+                    let hit_rows: Vec<SearchRowView> = self
+                        .search
+                        .hits
+                        .iter()
+                        .take(200)
+                        .map(|h| {
+                            let rel = h
+                                .path
+                                .strip_prefix(self.project.root())
+                                .unwrap_or(&h.path)
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            SearchRowView {
+                                path: rel,
+                                line_no: h.line_no,
+                                line: h.line.clone(),
+                                match_start: h.match_start,
+                                match_end: h.match_end,
+                            }
+                        })
+                        .collect();
+                    text.paint_search_panel(
+                        &mut self.scene,
+                        rect,
+                        &SearchPanelView {
+                            query: &self.search.query,
+                            is_regex: self.search.is_regex,
+                            case_sensitive: self.search.case_sensitive,
+                            whole_word: self.search.whole_word,
+                            rows: &hit_rows,
+                            selected: self.search.selected,
+                        },
+                        &palette,
+                        self.scale,
+                    );
+                } else {
+                    let rows: Vec<TreeRow<'_>> = self
+                        .tree
+                        .entries()
+                        .iter()
+                        .map(|e| TreeRow {
+                            name: &e.name,
+                            depth: e.depth,
+                            is_dir: e.is_dir,
+                            expanded: e.expanded,
+                        })
+                        .collect();
+                    self.tree_scroll = text.paint_file_tree(
+                        &mut self.scene,
+                        rect,
+                        &TreeView {
+                            rows: &rows,
+                            scroll_px: self.tree_scroll,
+                            hovered: self.tree_hover,
+                        },
+                        &palette,
+                        self.scale,
+                    );
+                }
             }
         }
 
-        // Editor canvas with gutter marks.
+        // Editor canvas.
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let palette = chrome.palette();
             let syntax = chrome.syntax();
@@ -815,50 +1290,98 @@ impl App {
                     scale: self.scale,
                     show_caret: self.focused,
                     gutter_marks: &gutter_marks,
+                    diff_marks: &diff_marks,
                 },
             );
         }
 
-        // Hover card (only when cursor is in editor area and still).
-        if let (Some(ref card), Some(text), Some(chrome)) =
-            (hover_card, &mut self.text, &self.chrome)
+        // Terminal panel.
+        if let (Some(term), Some(text), Some(chrome)) =
+            (&self.terminal, &mut self.text, &self.chrome)
         {
-            if let Some(anchor) = self.cursor {
-                let palette = chrome.palette();
-                let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
-                text.paint_hover_card(&mut self.scene, screen, anchor, card, &palette, self.scale);
-            }
-        }
-
-        // Completion popup.
-        if completion_open && !completion_items.is_empty() {
-            if let (Some(anchor), Some(text), Some(chrome)) =
-                (caret_anchor, &mut self.text, &self.chrome)
-            {
-                let palette = chrome.palette();
-                let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
-                let entries: Vec<CompletionEntry> = completion_items
-                    .iter()
-                    .map(|c| CompletionEntry {
-                        label: c.label.clone(),
-                        detail: c.detail.clone(),
-                    })
-                    .collect();
-                text.paint_completion(
+            let rect = chrome.terminal_rect();
+            if rect.height() > 2.0 {
+                let grid = term.grid();
+                let row_slices: Vec<&[eden_terminal::TermCell]> =
+                    (0..grid.rows).map(|r| grid.row(r)).collect();
+                text.paint_terminal(
                     &mut self.scene,
-                    screen,
-                    &CompletionView {
-                        entries: &entries,
-                        selected: completion_selected,
-                        anchor,
+                    rect,
+                    &TerminalView {
+                        rows: &row_slices,
+                        cols: grid.cols,
+                        cursor_row: grid.cursor_row,
+                        cursor_col: grid.cursor_col,
+                        focused: self.focused,
                     },
-                    &palette,
                     self.scale,
                 );
             }
         }
 
-        // Cmd-P palette (drawn last, on top of everything).
+        // Hover card.
+        if let (Some(ref card), Some(text), Some(chrome), Some(anchor)) =
+            (hover_card, &mut self.text, &self.chrome, self.cursor)
+        {
+            let palette = chrome.palette();
+            let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+            text.paint_hover_card(&mut self.scene, screen, anchor, card, &palette, self.scale);
+        }
+
+        // Completion popup.
+        if completion_open
+            && !completion_items.is_empty()
+            && let (Some(anchor), Some(text), Some(chrome)) =
+                (caret_anchor, &mut self.text, &self.chrome)
+        {
+            let palette = chrome.palette();
+            let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+            let entries: Vec<CompletionEntry> = completion_items
+                .iter()
+                .map(|c| CompletionEntry { label: c.label.clone(), detail: c.detail.clone() })
+                .collect();
+            text.paint_completion(
+                &mut self.scene,
+                screen,
+                &CompletionView {
+                    entries: &entries,
+                    selected: completion_selected,
+                    anchor,
+                },
+                &palette,
+                self.scale,
+            );
+        }
+
+        // Command palette (drawn before Cmd-P so Ctrl+Shift+P takes precedence).
+        if let (Some(cp), Some(text), Some(chrome)) =
+            (&self.cmd_palette, &mut self.text, &self.chrome)
+        {
+            let entries: Vec<CmdEntry> = cp
+                .filtered
+                .iter()
+                .take(10)
+                .filter_map(|&i| cp.commands.get(i))
+                .map(|c| CmdEntry {
+                    label: c.label.to_owned(),
+                    shortcut: c.shortcut.map(str::to_owned),
+                })
+                .collect();
+            let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+            text.paint_cmd_palette(
+                &mut self.scene,
+                screen,
+                &CmdPaletteView {
+                    query: &cp.query,
+                    entries: &entries,
+                    selected: cp.selected,
+                },
+                &chrome.palette(),
+                self.scale,
+            );
+        }
+
+        // Cmd-P file palette (drawn last, on top of everything).
         if let Some(state) = &self.palette
             && let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome)
         {
@@ -995,7 +1518,6 @@ impl ApplicationHandler for App {
                     chrome.set_hover(Some(point));
                 }
                 self.tree_hover = self.tree_row_at(point);
-                // Reset hover timer and discard any stale card.
                 self.cursor_still_since = Instant::now();
                 self.hover_requested_for = None;
                 if let Some(path) = &self.current_path.clone() {

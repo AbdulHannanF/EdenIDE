@@ -1,6 +1,6 @@
 [package]
 name = "eden-terminal"
-description = "Embedded terminal for Eden — alacritty_terminal rendered through the vello pipeline."
+description = "Embedded terminal for Eden — portable-pty PTY backend with VTE parsing, rendered through the vello pipeline."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,3 +11,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+crossbeam-channel.workspace = true
+parking_lot.workspace = true
+portable-pty = "0.8"
+vte = "0.13"
+eden-theme.workspace = true

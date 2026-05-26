@@ -122,6 +122,20 @@ impl Widget for EditorArea {
     }
 }
 
+/// The terminal panel background. Real cell content is drawn over this by
+/// [`crate::TextSystem::paint_terminal`].
+#[derive(Default)]
+pub struct TerminalPanel;
+
+impl Widget for TerminalPanel {
+    fn paint(&self, scene: &mut Scene, bounds: Rect, ctx: &PaintCtx) {
+        if bounds.height() < 2.0 {
+            return;
+        }
+        fill_rect(scene, bounds, with_alpha(ctx.palette.background, 0xF0));
+    }
+}
+
 /// The bottom status bar: a branch chip on the left, position/lang on the right.
 #[derive(Default)]
 pub struct StatusBar;

@@ -30,8 +30,8 @@ crates/
   eden-workspace/  Project (file listing) + FileTree (lazy expand)
   eden-theme/      Palette, Syntax, Theme (3 built-ins + TOML round-trip)
   eden-lsp/        STUB — Phase 4
-  eden-vcs/        STUB — Phase 5
-  eden-terminal/   STUB — Phase 5
+  eden-vcs/        git status, diff hunks, blame — Phase 5
+  eden-terminal/   PTY + VTE terminal backend — Phase 5
   eden-plugin/     STUB — Phase 7
 themes/
   eden-day.toml / eden-dusk.toml / eden-noir.toml
@@ -47,8 +47,8 @@ themes/
 | 1 | The Surface — chrome, taffy layout, spring motion, 3 themes | **Done** (`4bb18cd`) |
 | 2 | The Buffer — ropey editor, cosmic-text rendering, undo, scroll | **Done** (`28cf420`) |
 | 3 | Syntax & Files — tree-sitter (Rust), file tree, Cmd-P | **Done** (`750bca9`) |
-| 4 | Intelligence — LSP client, completion, hover, diagnostics | **Next** |
-| 5 | Surroundings — project search, command palette, terminal, git | Pending |
+| 4 | Intelligence — LSP client, completion, hover, diagnostics | **Done** (`730a95b`) |
+| 5 | Surroundings — project search, command palette, terminal, git | **Done** |
 | 6 | Signature features (pick 6 of 9) | Pending |
 | 7 | Polish — settings UI, bundle, icon, telemetry | Pending |
 

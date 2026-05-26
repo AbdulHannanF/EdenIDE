@@ -11,3 +11,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+git2 = "0.19"

@@ -11,7 +11,7 @@ use vello::Scene;
 use vello::kurbo::{Point, Rect};
 
 use crate::paint::fill_rect;
-use crate::panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TitleBar};
+use crate::panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TerminalPanel, TitleBar};
 use crate::widget::{PaintCtx, Widget};
 
 // design: logical sizes (multiplied by the display scale). Heights and the
@@ -33,6 +33,8 @@ pub enum Region {
     TabStrip,
     /// The editor canvas.
     EditorArea,
+    /// The embedded terminal panel (may be zero-height when hidden).
+    Terminal,
     /// The bottom status bar.
     StatusBar,
 }
@@ -40,7 +42,7 @@ pub enum Region {
 impl Region {
     /// Whether hovering this region produces a visible response.
     fn is_interactive(self) -> bool {
-        matches!(self, Region::Sidebar | Region::TabStrip)
+        matches!(self, Region::Sidebar | Region::TabStrip | Region::Terminal)
     }
 }
 
@@ -56,6 +58,9 @@ struct Invalidation {
     paint: bool,
 }
 
+// design: terminal panel height on the 4px grid.
+const TERMINAL_H: f64 = 220.0;
+
 /// Node handles into the taffy tree.
 struct Nodes {
     root: NodeId,
@@ -65,6 +70,7 @@ struct Nodes {
     main_col: NodeId,
     tab_strip: NodeId,
     editor: NodeId,
+    terminal: NodeId,
     status_bar: NodeId,
 }
 
@@ -90,12 +96,16 @@ pub struct Chrome {
     hover: Spring,
     hover_anchor: Option<Region>,
 
+    terminal_h: Spring,
+    terminal_open: bool,
+
     invalid: Invalidation,
 
     title_bar: TitleBar,
     sidebar_panel: SidebarPanel,
     tab_strip: TabStrip,
     editor: EditorArea,
+    terminal_panel: TerminalPanel,
     status: StatusBar,
 }
 
@@ -118,8 +128,9 @@ impl Chrome {
         let sidebar = leaf(&mut tree)?;
         let tab_strip = leaf(&mut tree)?;
         let editor = leaf(&mut tree)?;
+        let terminal = leaf(&mut tree)?;
         let status_bar = leaf(&mut tree)?;
-        let main_col = tree.new_with_children(Style::default(), &[tab_strip, editor])?;
+        let main_col = tree.new_with_children(Style::default(), &[tab_strip, editor, terminal])?;
         let body = tree.new_with_children(Style::default(), &[sidebar, main_col])?;
         let root = tree.new_with_children(Style::default(), &[title_bar, body, status_bar])?;
 
@@ -137,6 +148,7 @@ impl Chrome {
                 main_col,
                 tab_strip,
                 editor,
+                terminal,
                 status_bar,
             },
             width,
@@ -153,11 +165,15 @@ impl Chrome {
             theme_mix: Spring::with_config(1.0, prefs.resolve(SpringConfig::UNIT)),
             hover: Spring::with_config(0.0, prefs.resolve(SpringConfig::SNAPPY)),
             hover_anchor: None,
+            // design: terminal starts hidden (height 0).
+            terminal_h: Spring::with_config(0.0, prefs.resolve(SpringConfig::DEFAULT)),
+            terminal_open: false,
             invalid: Invalidation { layout: true, paint: true },
             title_bar: TitleBar,
             sidebar_panel: SidebarPanel,
             tab_strip: TabStrip,
             editor: EditorArea,
+            terminal_panel: TerminalPanel,
             status: StatusBar,
         };
         chrome.apply_styles();
@@ -250,6 +266,11 @@ impl Chrome {
             animating = true;
             self.invalid.paint = true;
         }
+        if self.terminal_h.step(dt) {
+            animating = true;
+            self.invalid.layout = true;
+            self.invalid.paint = true;
+        }
         animating
     }
 
@@ -271,6 +292,25 @@ impl Chrome {
         self.displayed_syntax()
     }
 
+    /// Toggles the embedded terminal panel open or closed.
+    pub fn toggle_terminal(&mut self) {
+        self.terminal_open = !self.terminal_open;
+        let target = self.terminal_target();
+        if self.prefs.reduce_motion {
+            self.terminal_h.jump_to(target);
+        } else {
+            self.terminal_h.set_target(target);
+        }
+        self.invalid.layout = true;
+        self.invalid.paint = true;
+    }
+
+    /// Whether the terminal panel is currently open (or animating open).
+    #[must_use]
+    pub fn terminal_open(&self) -> bool {
+        self.terminal_open
+    }
+
     /// The absolute rect of the editor canvas, where text is drawn.
     #[must_use]
     pub fn editor_rect(&self) -> Rect {
@@ -281,6 +321,12 @@ impl Chrome {
     #[must_use]
     pub fn sidebar_rect(&self) -> Rect {
         self.region_rect(Region::Sidebar)
+    }
+
+    /// The absolute rect of the terminal panel.
+    #[must_use]
+    pub fn terminal_rect(&self) -> Rect {
+        self.region_rect(Region::Terminal)
     }
 
     fn region_rect(&self, want: Region) -> Rect {
@@ -335,6 +381,14 @@ impl Chrome {
         }
     }
 
+    fn terminal_target(&self) -> f64 {
+        if self.terminal_open {
+            TERMINAL_H * self.scale
+        } else {
+            0.0
+        }
+    }
+
     fn displayed_palette(&self) -> Palette {
         self.prev_palette
             .lerp(self.themes[self.active_theme].palette, self.theme_mix.value())
@@ -359,6 +413,7 @@ impl Chrome {
             Region::Sidebar => &self.sidebar_panel,
             Region::TabStrip => &self.tab_strip,
             Region::EditorArea => &self.editor,
+            Region::Terminal => &self.terminal_panel,
             Region::StatusBar => &self.status,
         }
     }
@@ -421,6 +476,15 @@ impl Chrome {
             },
             ..Style::default()
         };
+        let terminal_h_px = self.terminal_h.value().max(0.0) as f32;
+        let terminal_style = Style {
+            size: TaffySize {
+                width: percent(1.0_f32),
+                height: length(terminal_h_px),
+            },
+            flex_shrink: 0.0,
+            ..Style::default()
+        };
 
         // Errors here only occur for invalid node ids, which cannot happen.
         let _ = self.tree.set_style(self.nodes.root, root_style);
@@ -430,6 +494,7 @@ impl Chrome {
         let _ = self.tree.set_style(self.nodes.main_col, main_style);
         let _ = self.tree.set_style(self.nodes.tab_strip, row(TAB_H));
         let _ = self.tree.set_style(self.nodes.editor, editor_style);
+        let _ = self.tree.set_style(self.nodes.terminal, terminal_style);
         let _ = self.tree.set_style(self.nodes.status_bar, row(STATUS_H));
 
         let _ = self.tree.compute_layout(
@@ -442,7 +507,7 @@ impl Chrome {
     }
 
     /// Computes absolute rects for each painted region from the taffy layout.
-    fn regions(&self) -> [(Region, Rect); 5] {
+    fn regions(&self) -> [(Region, Rect); 6] {
         let loc = |node: NodeId| {
             self.tree
                 .layout(node)
@@ -460,6 +525,7 @@ impl Chrome {
         let main = loc(self.nodes.main_col);
         let tab = loc(self.nodes.tab_strip);
         let editor = loc(self.nodes.editor);
+        let terminal = loc(self.nodes.terminal);
 
         let body_ox = body.0;
         let body_oy = body.1;
@@ -471,6 +537,7 @@ impl Chrome {
             (Region::Sidebar, rect(body_ox, body_oy, sidebar)),
             (Region::TabStrip, rect(main_ox, main_oy, tab)),
             (Region::EditorArea, rect(main_ox, main_oy, editor)),
+            (Region::Terminal, rect(main_ox, main_oy, terminal)),
             (Region::StatusBar, rect(0.0, 0.0, status)),
         ]
     }
@@ -479,10 +546,11 @@ impl Chrome {
         let t = self.scale.max(1.0); // ~1 logical px
         let regions = self.regions();
         let find = |want: Region| regions.iter().find(|(r, _)| *r == want).map(|(_, rc)| *rc);
-        let (Some(title), Some(sidebar), Some(tab), Some(status)) = (
+        let (Some(title), Some(sidebar), Some(tab), Some(terminal), Some(status)) = (
             find(Region::TitleBar),
             find(Region::Sidebar),
             find(Region::TabStrip),
+            find(Region::Terminal),
             find(Region::StatusBar),
         ) else {
             return;
@@ -497,6 +565,10 @@ impl Chrome {
         // Between sidebar and main column (only when the sidebar is showing).
         if sidebar.width() > 2.0 {
             fill_rect(scene, Rect::new(sidebar.x1 - t, title.y1, sidebar.x1, status.y0), palette.divider);
+        }
+        // Above the terminal panel (only when it has height).
+        if terminal.height() > 2.0 {
+            fill_rect(scene, Rect::new(terminal.x0, terminal.y0, terminal.x1, terminal.y0 + t), palette.divider);
         }
     }
 }
@@ -525,6 +597,9 @@ mod tests {
         let editor = regions.iter().find(|(r, _)| *r == Region::EditorArea).unwrap().1;
         assert!(editor.x0 >= sidebar.x1 - 0.5);
         assert!((sidebar.width() - SIDEBAR_W).abs() < 0.5);
+        // Terminal starts hidden (height 0).
+        let terminal = regions.iter().find(|(r, _)| *r == Region::Terminal).unwrap().1;
+        assert!(terminal.height() < 0.5);
     }
 
     #[test]

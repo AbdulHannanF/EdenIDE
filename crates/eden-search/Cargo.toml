@@ -12,3 +12,10 @@ workspace = true
 
 [dependencies]
 nucleo = "0.5.0"
+anyhow.workspace = true
+crossbeam-channel.workspace = true
+grep-matcher.workspace = true
+grep-regex.workspace = true
+grep-searcher.workspace = true
+ignore.workspace = true
+tracing.workspace = true

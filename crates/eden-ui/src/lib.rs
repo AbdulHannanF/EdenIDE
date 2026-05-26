@@ -13,10 +13,10 @@ mod widget;
 
 pub use chrome::{Chrome, Region};
 pub use paint::{fill_rect, fill_rrect, to_color};
-pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TitleBar};
+pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TerminalPanel, TitleBar};
 pub use text::{
-    CompletionEntry, CompletionView, EditorFrame, GutterMark, PaletteView, TextSystem, TreeRow,
-    TreeView,
+    CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, EditorFrame, GutterMark,
+    PaletteView, SearchPanelView, SearchRowView, TerminalView, TextSystem, TreeRow, TreeView,
 };
 pub use widget::{PaintCtx, Widget};
 
