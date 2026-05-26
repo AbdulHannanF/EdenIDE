@@ -4,18 +4,20 @@ A desktop code editor written in pure Rust, rendered on the GPU. Eden aims for
 the seam between Zed's raw performance, Linear's design discipline, Raycast's
 command-driven ergonomics, and the quiet confidence of native macOS apps.
 
-> **Status: Phase 2 — The Buffer.** The editor canvas hosts a real, editable
-> text buffer (ropey), rendered with cosmic-text shaping and vello glyph drawing
-> — only the visible lines are shaped each frame, so large files stay fast.
-> Multi-cursor model, selections, snapshot undo/redo (typing coalesces), and
-> spring-driven momentum scrolling. Type to insert; arrows move (Shift extends);
-> Backspace/Delete/Home/End/Enter/Tab; Ctrl+Z / Ctrl+Shift+Z undo/redo; Ctrl+A
-> select-all; wheel scrolls. Chrome controls moved under a modifier so letters
-> type: Ctrl+B toggles the sidebar, Ctrl+T crossfades the theme.
+> **Status: Phase 3 — Syntax & Files.** On top of the editable buffer (Phase 2),
+> the editor now has **tree-sitter syntax highlighting** (Rust grammar; glyphs
+> coloured per highlight kind, crossfading with the theme), a **gitignore-aware
+> sidebar file tree** (lazy expand, virtual-scrolled, click to open), and
+> **Cmd-P fuzzy file open** (Ctrl+P; nucleo-ranked, opens into the editor).
 >
-> Known gaps carried forward: soft-wrap (no-wrap only, to keep caret math exact),
-> block/column selection, a living (pulsing) caret, and bundling JetBrains Mono
-> (currently uses system Consolas).
+> Editing (Phase 2): ropey buffer, multi-cursor, selections, snapshot undo/redo
+> (typing coalesces), spring momentum scroll. Type to insert; arrows move (Shift
+> extends); Backspace/Delete/Home/End/Enter/Tab; Ctrl+Z / Ctrl+Shift+Z; Ctrl+A.
+> Ctrl+B toggles the sidebar, Ctrl+T crossfades the theme, Ctrl+P opens files.
+>
+> Known gaps carried forward: incremental (InputEdit) re-highlighting, soft-wrap,
+> block/column selection, a pulsing caret, click-to-place-caret in the editor,
+> more grammars, and bundling JetBrains Mono (currently system Consolas).
 
 ## Architecture
 

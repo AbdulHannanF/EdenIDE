@@ -274,9 +274,19 @@ impl Chrome {
     /// The absolute rect of the editor canvas, where text is drawn.
     #[must_use]
     pub fn editor_rect(&self) -> Rect {
+        self.region_rect(Region::EditorArea)
+    }
+
+    /// The absolute rect of the sidebar, where the file tree is drawn.
+    #[must_use]
+    pub fn sidebar_rect(&self) -> Rect {
+        self.region_rect(Region::Sidebar)
+    }
+
+    fn region_rect(&self, want: Region) -> Rect {
         self.regions()
             .into_iter()
-            .find(|(region, _)| *region == Region::EditorArea)
+            .find(|(region, _)| *region == want)
             .map_or(Rect::ZERO, |(_, rect)| rect)
     }
 

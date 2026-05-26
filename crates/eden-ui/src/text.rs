@@ -58,6 +58,28 @@ pub struct EditorFrame<'a> {
     pub show_caret: bool,
 }
 
+/// One row of the sidebar file tree to render.
+pub struct TreeRow<'a> {
+    /// File or directory name.
+    pub name: &'a str,
+    /// Nesting depth (root children are 0).
+    pub depth: usize,
+    /// Whether this is a directory.
+    pub is_dir: bool,
+    /// Whether an expanded directory.
+    pub expanded: bool,
+}
+
+/// The sidebar file tree to render.
+pub struct TreeView<'a> {
+    /// The flattened, visible rows.
+    pub rows: &'a [TreeRow<'a>],
+    /// Vertical scroll offset in physical pixels (clamped internally).
+    pub scroll_px: f64,
+    /// The row index under the cursor, if any.
+    pub hovered: Option<usize>,
+}
+
 /// The command-palette content to render.
 pub struct PaletteView<'a> {
     /// The current query text.
@@ -306,6 +328,71 @@ impl TextSystem {
                     palette.accent,
                 );
             }
+        }
+
+        scene.pop_layer();
+        scroll
+    }
+
+    /// Paints the sidebar file tree into `area` with virtual scrolling (only
+    /// the visible rows are drawn). Returns the clamped scroll offset.
+    pub fn paint_file_tree(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &TreeView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) -> f64 {
+        let rows = view.rows;
+        let scroll_px = view.scroll_px;
+        let hovered = view.hovered;
+        self.ensure_metrics(scale);
+        let row_h = self.line_h;
+
+        let max_scroll = (rows.len() as f64 * row_h - area.height()).max(0.0);
+        let scroll = scroll_px.clamp(0.0, max_scroll);
+        let first = (scroll / row_h).floor() as usize;
+        let frac = scroll - first as f64 * row_h;
+        let count = ((area.height() + frac) / row_h).ceil() as usize + 1;
+        let last = (first + count).min(rows.len());
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &area);
+        fill_rect(scene, area, palette.surface);
+
+        for (i, row) in rows.iter().enumerate().take(last).skip(first) {
+            let top = area.y0 - frac + (i - first) as f64 * row_h;
+            if hovered == Some(i) {
+                fill_rect(scene, Rect::new(area.x0, top, area.x1, top + row_h), with_alpha(palette.accent, 0x16));
+            }
+            let indent = area.x0 + 10.0 * scale + row.depth as f64 * 14.0 * scale;
+            let marker = 7.0 * scale;
+            let my = top + row_h * 0.5 - marker / 2.0;
+            if row.is_dir {
+                let color = if row.expanded {
+                    palette.accent
+                } else {
+                    with_alpha(palette.text_muted, 0xC0)
+                };
+                fill_rrect(scene, Rect::new(indent, my, indent + marker, my + marker), 2.0 * scale, color);
+            } else {
+                let dot = marker * 0.55;
+                let dy = top + row_h * 0.5 - dot / 2.0;
+                fill_rrect(
+                    scene,
+                    Rect::new(indent + (marker - dot) / 2.0, dy, indent + (marker + dot) / 2.0, dy + dot),
+                    dot / 2.0,
+                    with_alpha(palette.text_muted, 0x80),
+                );
+            }
+            let name_x = indent + marker + 8.0 * scale;
+            let baseline = top + row_h * 0.7;
+            let color = if row.is_dir {
+                palette.text
+            } else {
+                with_alpha(palette.text, 0xDD)
+            };
+            self.draw_text(scene, row.name, name_x, baseline, color);
         }
 
         scene.pop_layer();

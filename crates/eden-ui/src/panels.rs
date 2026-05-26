@@ -60,7 +60,8 @@ impl Widget for TitleBar {
     }
 }
 
-/// The left sidebar: an explorer header and placeholder file rows.
+/// The left sidebar background. The interactive file tree is drawn over this
+/// rect by [`crate::TextSystem::paint_file_tree`], which owns the tree model.
 #[derive(Default)]
 pub struct SidebarPanel;
 
@@ -69,43 +70,7 @@ impl Widget for SidebarPanel {
         if bounds.width() < 2.0 {
             return; // collapsed
         }
-        let s = ctx.scale;
-        let p = ctx.palette;
-        fill_rect(scene, bounds, p.surface);
-
-        let pad = 16.0 * s;
-        // Section header.
-        bar(scene, bounds.x0 + pad, bounds.y0 + 16.0 * s, 96.0 * s, 6.0 * s, with_alpha(p.text_muted, 0xC0));
-
-        // File rows. Indentation cycles to suggest a tree.
-        let row_h = 26.0 * s;
-        let mut y = bounds.y0 + 44.0 * s;
-        let indents = [0.0, 0.0, 1.0, 1.0, 2.0, 1.0, 0.0, 0.0, 1.0];
-        let widths = [120.0, 96.0, 80.0, 104.0, 72.0, 88.0, 132.0, 100.0, 76.0];
-        for (indent, width) in indents.iter().zip(widths.iter()) {
-            if y + row_h > bounds.y1 {
-                break;
-            }
-            let x = bounds.x0 + pad + indent * 14.0 * s;
-            let icon = 9.0 * s;
-            let row_cy = y + row_h / 2.0;
-            // Icon glyph placeholder.
-            fill_rrect(
-                scene,
-                Rect::new(x, row_cy - icon / 2.0, x + icon, row_cy + icon / 2.0),
-                2.0 * s,
-                with_alpha(p.text_muted, 0x80),
-            );
-            // Filename bar.
-            bar(scene, x + icon + 8.0 * s, row_cy - 3.0 * s, width * s, 6.0 * s, with_alpha(p.text_muted, 0x9A));
-            y += row_h;
-        }
-
-        // Hover wash.
-        if ctx.hover > 0.001 {
-            let alpha = (ctx.hover * f64::from(0x16)).round() as u8;
-            fill_rect(scene, bounds, with_alpha(p.accent, alpha));
-        }
+        fill_rect(scene, bounds, ctx.palette.surface);
     }
 }
 

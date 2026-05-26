@@ -15,8 +15,11 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use eden_motion::{MotionPrefs, Spring, SpringConfig};
 use eden_search::FuzzyMatcher;
-use eden_ui::{Chrome, Editor, EditorFrame, Highlighter, Highlights, PaletteView, TextSystem};
-use eden_workspace::Project;
+use eden_ui::{
+    Chrome, Editor, EditorFrame, Highlighter, Highlights, PaletteView, TextSystem, TreeRow,
+    TreeView,
+};
+use eden_workspace::{FileTree, Project};
 use vello::kurbo::{Point, Rect};
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
@@ -24,7 +27,7 @@ use vello::wgpu;
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
@@ -72,6 +75,10 @@ struct App {
     files: Vec<String>,
     fuzzy: FuzzyMatcher,
     palette: Option<PaletteState>,
+    tree: FileTree,
+    tree_scroll: f64,
+    tree_hover: Option<usize>,
+    cursor: Option<Point>,
     scroll: Spring,
     prefs: MotionPrefs,
     mods: ModifiersState,
@@ -105,6 +112,7 @@ impl App {
         let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
         let project = Project::new(root);
         let files = project.file_strings();
+        let tree = FileTree::new(project.root());
         Self {
             context: RenderContext::new(),
             renderers: Vec::new(),
@@ -120,6 +128,10 @@ impl App {
             files,
             fuzzy: FuzzyMatcher::new(),
             palette: None,
+            tree,
+            tree_scroll: 0.0,
+            tree_hover: None,
+            cursor: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             prefs: MotionPrefs::from_env(),
             mods: ModifiersState::empty(),
@@ -354,19 +366,69 @@ impl App {
             self.palette = None;
             return;
         };
-        let rel = &self.files[file_idx];
-        let path = self.project.root().join(rel);
-        match std::fs::read_to_string(&path) {
+        let path = self.project.root().join(&self.files[file_idx]);
+        self.open_path(&path);
+        self.palette = None;
+    }
+
+    /// Reads `path` into the editor, resetting highlights and scroll.
+    fn open_path(&mut self, path: &std::path::Path) {
+        match std::fs::read_to_string(path) {
             Ok(contents) => {
                 self.editor = Editor::from_text(&contents);
                 self.doc_dirty = true;
                 self.scroll.jump_to(0.0);
                 self.ensure_visible = true;
-                tracing::info!(file = %rel, "opened");
+                tracing::info!(file = %path.display(), "opened");
             }
-            Err(err) => tracing::warn!(file = %rel, "could not open: {err}"),
+            Err(err) => tracing::warn!(file = %path.display(), "could not open: {err}"),
         }
-        self.palette = None;
+    }
+
+    /// The file-tree row at a physical-pixel point, if the cursor is over the
+    /// (open) sidebar.
+    fn tree_row_at(&self, point: Point) -> Option<usize> {
+        let text = self.text.as_ref()?;
+        let chrome = self.chrome.as_ref()?;
+        let rect = chrome.sidebar_rect();
+        if rect.width() < 2.0 || !rect.contains(point) {
+            return None;
+        }
+        let row_h = text.line_height();
+        let idx = ((point.y - rect.y0 + self.tree_scroll) / row_h).floor();
+        if idx < 0.0 {
+            return None;
+        }
+        let idx = idx as usize;
+        (idx < self.tree.entries().len()).then_some(idx)
+    }
+
+    /// Handles a left click: toggles a tree directory or opens a tree file.
+    fn on_click(&mut self) -> bool {
+        let Some(point) = self.cursor else {
+            return false;
+        };
+        let Some(idx) = self.tree_row_at(point) else {
+            return false;
+        };
+        let entry = &self.tree.entries()[idx];
+        if entry.is_dir {
+            self.tree.toggle(idx);
+        } else {
+            let path = entry.path.clone();
+            self.open_path(&path);
+        }
+        true
+    }
+
+    fn over_sidebar(&self) -> bool {
+        let Some(point) = self.cursor else {
+            return false;
+        };
+        self.chrome.as_ref().is_some_and(|c| {
+            let rect = c.sidebar_rect();
+            rect.width() > 2.0 && rect.contains(point)
+        })
     }
 
     /// Runs an editor action and schedules a scroll-to-caret. `mutates` marks
@@ -473,6 +535,34 @@ impl App {
         self.scene.reset();
         if let Some(chrome) = &mut self.chrome {
             chrome.paint(&mut self.scene);
+        }
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let rect = chrome.sidebar_rect();
+            if rect.width() > 2.0 {
+                let palette = chrome.palette();
+                let rows: Vec<TreeRow<'_>> = self
+                    .tree
+                    .entries()
+                    .iter()
+                    .map(|e| TreeRow {
+                        name: &e.name,
+                        depth: e.depth,
+                        is_dir: e.is_dir,
+                        expanded: e.expanded,
+                    })
+                    .collect();
+                self.tree_scroll = text.paint_file_tree(
+                    &mut self.scene,
+                    rect,
+                    &TreeView {
+                        rows: &rows,
+                        scroll_px: self.tree_scroll,
+                        hovered: self.tree_hover,
+                    },
+                    &palette,
+                    self.scale,
+                );
+            }
         }
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let palette = chrome.palette();
@@ -618,16 +708,31 @@ impl ApplicationHandler for App {
             }
             WindowEvent::ModifiersChanged(modifiers) => self.mods = modifiers.state(),
             WindowEvent::CursorMoved { position, .. } => {
+                let point = Point::new(position.x, position.y);
+                self.cursor = Some(point);
                 if let Some(chrome) = &mut self.chrome {
-                    chrome.set_hover(Some(Point::new(position.x, position.y)));
+                    chrome.set_hover(Some(point));
                 }
+                self.tree_hover = self.tree_row_at(point);
                 self.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                self.tree_hover = None;
                 if let Some(chrome) = &mut self.chrome {
                     chrome.set_hover(None);
                 }
                 self.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                let changed = self.on_click();
+                if changed {
+                    self.request_redraw();
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let line_h = self.text.as_ref().map_or(20.0, TextSystem::line_height);
@@ -635,7 +740,11 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => f64::from(y) * line_h * 3.0,
                     MouseScrollDelta::PixelDelta(p) => p.y,
                 };
-                self.scroll.set_target(self.scroll.target() - dy);
+                if self.over_sidebar() {
+                    self.tree_scroll = (self.tree_scroll - dy).max(0.0);
+                } else {
+                    self.scroll.set_target(self.scroll.target() - dy);
+                }
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput {

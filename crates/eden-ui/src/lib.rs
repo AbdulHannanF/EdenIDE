@@ -14,7 +14,7 @@ mod widget;
 pub use chrome::{Chrome, Region};
 pub use paint::{fill_rect, fill_rrect, to_color};
 pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TitleBar};
-pub use text::{EditorFrame, PaletteView, TextSystem};
+pub use text::{EditorFrame, PaletteView, TextSystem, TreeRow, TreeView};
 pub use widget::{PaintCtx, Widget};
 
 // Re-exported so callers can build/drive an editor and highlighter without
