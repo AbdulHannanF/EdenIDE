@@ -77,6 +77,10 @@ pub struct EditorFrame<'a> {
     pub gutter_marks: &'a [(u32, GutterMark)],
     /// Diff gutter markers, as `(zero-indexed line, mark)` pairs.
     pub diff_marks: &'a [(u32, DiffMark)],
+    /// Find-match char ranges `(start, end)` to highlight, if a find is active.
+    pub find_matches: &'a [(usize, usize)],
+    /// Index of the current find match within `find_matches`, if any.
+    pub find_current: Option<usize>,
 }
 
 /// One row of the sidebar file tree to render.
@@ -192,6 +196,45 @@ pub struct CompletionEntry {
     pub label: String,
     /// Optional secondary detail (type/module).
     pub detail: Option<String>,
+}
+
+/// The inline find/replace bar to render at the bottom of the editor.
+pub struct FindBarView<'a> {
+    /// Current find query.
+    pub query: &'a str,
+    /// Current replacement text.
+    pub replace: &'a str,
+    /// Whether the replace row is shown.
+    pub show_replace: bool,
+    /// Whether keyboard focus is on the replace input (vs the find input).
+    pub focus_replace: bool,
+    /// Total number of matches.
+    pub match_count: usize,
+    /// 1-based index of the current match (0 when there are none).
+    pub current: usize,
+    /// Whether case-sensitive matching is on.
+    pub case_sensitive: bool,
+    /// Whether whole-word matching is on.
+    pub whole_word: bool,
+}
+
+/// Clickable hit-rects returned by [`TextSystem::paint_find_bar`].
+#[derive(Clone, Copy)]
+pub struct FindBarHits {
+    /// The close (×) button.
+    pub close: Rect,
+    /// The previous-match button.
+    pub prev: Rect,
+    /// The next-match button.
+    pub next: Rect,
+    /// The case-sensitivity toggle.
+    pub case: Rect,
+    /// The whole-word toggle.
+    pub word: Rect,
+    /// The "Replace" (current) button.
+    pub replace_one: Rect,
+    /// The "Replace All" button.
+    pub replace_all: Rect,
 }
 
 /// The completion popup to render.
@@ -395,6 +438,8 @@ impl TextSystem {
             h_scroll_fade,
             gutter_marks,
             diff_marks,
+            find_matches,
+            find_current,
         } = *frame;
         self.ensure_metrics(scale);
         let buffer = editor.buffer();
@@ -526,6 +571,32 @@ impl TextSystem {
                     palette.selection,
                 );
             }
+        }
+
+        // Find-match highlights: every match gets a wash, the current match a
+        // stronger accent fill. Drawn behind the text like selections.
+        for (i, &(mstart, mend)) in find_matches.iter().enumerate() {
+            if mstart >= mend {
+                continue;
+            }
+            let mline = buffer.char_to_line(mstart);
+            if mline < first_line || mline >= last_line {
+                continue;
+            }
+            let line_start = buffer.line_to_char(mline);
+            let col0 = mstart - line_start;
+            let col1 = (mend - line_start).min(buffer.line_len(mline) + 1);
+            let y = row_top(mline);
+            let x0 = text_x + col0 as f64 * advance;
+            let x1 = text_x + col1 as f64 * advance;
+            let is_current = find_current == Some(i);
+            let alpha = if is_current { 0x8C } else { 0x3C };
+            fill_rrect(
+                scene,
+                Rect::new(x0, y + scale, x1.max(x0 + 2.0), y + line_h - scale),
+                2.0 * scale,
+                with_alpha(palette.accent, alpha),
+            );
         }
 
         // Text glyphs for the visible lines.
@@ -1410,6 +1481,173 @@ impl TextSystem {
             let mx = (area.x0 + area.x1 - w) * 0.5;
             self.draw_text(scene, msg, mx.max(x + 12.0 * scale), baseline, palette.accent);
         }
+    }
+
+    // ── find / replace bar ────────────────────────────────────────────────
+
+    /// Paints the inline find (and optional replace) bar pinned to the bottom
+    /// of `area` (the editor rect). Returns the clickable hit-rects.
+    pub fn paint_find_bar(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &FindBarView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) -> FindBarHits {
+        self.ensure_metrics(scale);
+        let row_h = 36.0 * scale;
+        let bar_h = if view.show_replace { row_h * 2.0 } else { row_h };
+        let bar = Rect::new(area.x0, area.y1 - bar_h, area.x1, area.y1);
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &bar);
+        fill_rect(scene, bar, palette.surface_raised);
+        fill_rect(scene, Rect::new(bar.x0, bar.y0, bar.x1, bar.y0 + scale.max(1.0)), palette.divider);
+
+        let pad = 12.0 * scale;
+        let btn = 24.0 * scale;
+        let half = 12.0 * scale;
+        let row1_cy = bar.y0 + row_h * 0.5;
+        let baseline1 = row1_cy + self.font_size_px * 0.34;
+
+        // Right-aligned controls: close, next, prev.
+        let mut rx = bar.x1 - pad - btn;
+        let close = Rect::new(rx, row1_cy - half, rx + btn, row1_cy + half);
+        self.draw_glyph_button(scene, close, "\u{00D7}", palette, false);
+        rx -= btn + 4.0 * scale;
+        let next = Rect::new(rx, row1_cy - half, rx + btn, row1_cy + half);
+        self.draw_glyph_button(scene, next, "\u{2193}", palette, false);
+        rx -= btn + 4.0 * scale;
+        let prev = Rect::new(rx, row1_cy - half, rx + btn, row1_cy + half);
+        self.draw_glyph_button(scene, prev, "\u{2191}", palette, false);
+
+        // Match count.
+        let count_txt = if view.match_count == 0 {
+            if view.query.is_empty() { String::new() } else { "No results".to_owned() }
+        } else {
+            format!("{} of {}", view.current, view.match_count)
+        };
+        let count_w = count_txt.chars().count() as f64 * self.advance;
+        let count_x = prev.x0 - 10.0 * scale - count_w;
+        self.draw_text(scene, &count_txt, count_x, baseline1, with_alpha(palette.text_muted, 0xCC));
+
+        // Toggle buttons before the count.
+        let mut tx = count_x - pad - btn;
+        let word = Rect::new(tx, row1_cy - half, tx + btn, row1_cy + half);
+        self.draw_toggle(scene, word, "\u{2423}b", view.whole_word, palette);
+        tx -= btn + 4.0 * scale;
+        let case = Rect::new(tx, row1_cy - half, tx + btn, row1_cy + half);
+        self.draw_toggle(scene, case, "Aa", view.case_sensitive, palette);
+
+        // Find input fills the remaining width on the left.
+        let input = Rect::new(bar.x0 + pad, row1_cy - 13.0 * scale, case.x0 - pad, row1_cy + 13.0 * scale);
+        self.draw_input(scene, input, view.query, "Find", !view.focus_replace, palette);
+
+        // Row 2: replacement input + buttons.
+        let (replace_one, replace_all) = if view.show_replace {
+            let row2_cy = bar.y0 + row_h * 1.5;
+            let all_w = 88.0 * scale;
+            let all = Rect::new(bar.x1 - pad - all_w, row2_cy - 13.0 * scale, bar.x1 - pad, row2_cy + 13.0 * scale);
+            self.draw_pill_button(scene, all, "Replace All", palette, scale);
+            let one_w = 76.0 * scale;
+            let one = Rect::new(all.x0 - 6.0 * scale - one_w, row2_cy - 13.0 * scale, all.x0 - 6.0 * scale, row2_cy + 13.0 * scale);
+            self.draw_pill_button(scene, one, "Replace", palette, scale);
+            let rinput = Rect::new(bar.x0 + pad, row2_cy - 13.0 * scale, one.x0 - pad, row2_cy + 13.0 * scale);
+            self.draw_input(scene, rinput, view.replace, "Replace", view.focus_replace, palette);
+            (one, all)
+        } else {
+            (Rect::ZERO, Rect::ZERO)
+        };
+
+        scene.pop_layer();
+        FindBarHits { close, prev, next, case, word, replace_one, replace_all }
+    }
+
+    /// Paints a small centred input prompt (used for Go-to-line). Returns the
+    /// panel rect.
+    pub fn paint_input_prompt(
+        &mut self,
+        scene: &mut Scene,
+        screen: Rect,
+        title: &str,
+        value: &str,
+        palette: &Palette,
+        scale: f64,
+    ) -> Rect {
+        self.ensure_metrics(scale);
+        fill_rect(scene, screen, Rgba8::rgba(0, 0, 0, 0x4D));
+        let width = 320.0 * scale;
+        let height = 88.0 * scale;
+        let x0 = screen.x0 + (screen.width() - width) / 2.0;
+        let y0 = screen.y0 + 120.0 * scale;
+        let panel = Rect::new(x0, y0, x0 + width, y0 + height);
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &panel);
+        fill_rrect(scene, panel, 10.0 * scale, palette.surface_raised);
+        let pad = 16.0 * scale;
+        self.draw_text(scene, title, x0 + pad, y0 + 26.0 * scale, with_alpha(palette.text_muted, 0xCC));
+        let input = Rect::new(x0 + pad, y0 + 40.0 * scale, x0 + width - pad, y0 + 72.0 * scale);
+        let display = if value.is_empty() { "…" } else { value };
+        let color = if value.is_empty() { with_alpha(palette.text_muted, 0xA0) } else { palette.text };
+        fill_rrect(scene, input, 6.0 * scale, palette.background);
+        self.draw_text(scene, display, input.x0 + 10.0 * scale, input.y0 + 21.0 * scale, color);
+        scene.pop_layer();
+        panel
+    }
+
+    /// Draws a rounded text input box with a placeholder and focus border.
+    fn draw_input(
+        &mut self,
+        scene: &mut Scene,
+        rect: Rect,
+        value: &str,
+        placeholder: &str,
+        focused: bool,
+        palette: &Palette,
+    ) {
+        let scale = self.scale;
+        fill_rrect(scene, rect, 6.0 * scale, palette.background);
+        if focused {
+            let t = 1.5 * scale;
+            let border = with_alpha(palette.accent, 0xB0);
+            fill_rect(scene, Rect::new(rect.x0, rect.y1 - t, rect.x1, rect.y1), border);
+        }
+        let (text, color) = if value.is_empty() {
+            (placeholder, with_alpha(palette.text_muted, 0xA0))
+        } else {
+            (value, palette.text)
+        };
+        let baseline = rect.y0 + rect.height() * 0.5 + self.font_size_px * 0.34;
+        self.draw_text(scene, text, rect.x0 + 8.0 * scale, baseline, color);
+    }
+
+    /// Draws a small square toggle button labelled `label`.
+    fn draw_toggle(&mut self, scene: &mut Scene, rect: Rect, label: &str, active: bool, palette: &Palette) {
+        let r = 4.0;
+        if active {
+            fill_rrect(scene, rect, r, palette.accent);
+        } else {
+            fill_rrect(scene, rect, r, with_alpha(palette.text_muted, 0x24));
+        }
+        let color = if active { palette.background } else { with_alpha(palette.text_muted, 0xCC) };
+        let baseline = rect.y0 + rect.height() * 0.5 + self.font_size_px * 0.34;
+        self.draw_text(scene, label, rect.x0 + 4.0, baseline, color);
+    }
+
+    /// Draws a small square icon button (no fill unless hovered later).
+    fn draw_glyph_button(&mut self, scene: &mut Scene, rect: Rect, glyph: &str, palette: &Palette, active: bool) {
+        if active {
+            fill_rrect(scene, rect, 4.0, with_alpha(palette.accent, 0x20));
+        }
+        let baseline = rect.y0 + rect.height() * 0.5 + self.font_size_px * 0.34;
+        self.draw_text(scene, glyph, rect.x0 + 6.0, baseline, with_alpha(palette.text, 0xCC));
+    }
+
+    /// Draws a pill-shaped labelled action button.
+    fn draw_pill_button(&mut self, scene: &mut Scene, rect: Rect, label: &str, palette: &Palette, scale: f64) {
+        fill_rrect(scene, rect, rect.height() * 0.5, with_alpha(palette.accent, 0x1E));
+        let w = label.chars().count() as f64 * self.advance;
+        let tx = rect.x0 + (rect.width() - w) * 0.5;
+        let baseline = rect.y0 + rect.height() * 0.5 + self.font_size_px * 0.34;
+        self.draw_text(scene, label, tx.max(rect.x0 + 4.0 * scale), baseline, palette.accent);
     }
 
     // ── shared drawing helpers ────────────────────────────────────────────

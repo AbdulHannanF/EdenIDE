@@ -26,9 +26,9 @@ use eden_terminal::TerminalBackend;
 use eden_theme::Rgba8;
 use eden_ui::{
     Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
-    EditorFrame, GutterMark, Highlighter, Highlights, MinimapView, PaletteView, SearchPanelView,
-    SearchRowView, ScrubberView, SettingsToggle, SettingsView, StatusBarView, TerminalView,
-    TextSystem, TreeRow, TreeView, fill_rrect,
+    EditorFrame, FindBarHits, FindBarView, GutterMark, Highlighter, Highlights, MinimapView,
+    PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle, SettingsView,
+    StatusBarView, TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -137,6 +137,11 @@ fn comment_token_for_path(path: Option<&std::path::Path>) -> &'static str {
         "sql" | "lua" => "-- ",
         _ => "// ",
     }
+}
+
+/// Whether a byte is part of an identifier (used for whole-word find).
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -297,6 +302,20 @@ impl SearchState {
     }
 }
 
+/// In-file find/replace state (Ctrl+F / Ctrl+H). Matches are char-index
+/// ranges `[start, end)` into the active buffer, recomputed on every edit.
+#[derive(Default)]
+struct FindState {
+    query: String,
+    replace: String,
+    matches: Vec<(usize, usize)>,
+    current: Option<usize>,
+    case_sensitive: bool,
+    whole_word: bool,
+    show_replace: bool,
+    focus_replace: bool,
+}
+
 struct CmdPaletteState {
     query: String,
     commands: Vec<Command>,
@@ -445,6 +464,13 @@ struct App {
     /// Transient status-bar message and the time it was set.
     toast: Option<(String, Instant)>,
 
+    // Find / replace (Ctrl+F / Ctrl+H) and go-to-line (Ctrl+G).
+    find_open: bool,
+    find: FindState,
+    find_hits: Option<FindBarHits>,
+    goto_open: bool,
+    goto_query: String,
+
     cursor: Option<Point>,
     scroll: Spring,
     // design: horizontal scroll offset in physical pixels. No spring — pixel
@@ -526,6 +552,11 @@ impl App {
             ghost_caret: None,
             go_to_def_pending: false,
             toast: None,
+            find_open: false,
+            find: FindState::default(),
+            find_hits: None,
+            goto_open: false,
+            goto_query: String::new(),
             cursor: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             h_scroll: 0.0,
@@ -644,6 +675,12 @@ impl App {
         let ctrl = self.mods.control_key() || self.mods.super_key();
         let shift = self.mods.shift_key();
         let alt = self.mods.alt_key();
+        if self.goto_open && self.on_goto_key(event, ctrl) {
+            return true;
+        }
+        if self.find_open && self.on_find_key(event, ctrl, shift) {
+            return true;
+        }
         match &event.logical_key {
             Key::Named(NamedKey::F12) => {
                 self.go_to_definition();
@@ -781,6 +818,14 @@ impl App {
     /// Closes the topmost open overlay (palette, search, completion, etc).
     /// Returns whether anything was closed.
     fn close_top_overlay(&mut self) -> bool {
+        if self.goto_open {
+            self.goto_open = false;
+            return true;
+        }
+        if self.find_open {
+            self.find_open = false;
+            return true;
+        }
         if self.completion_open {
             self.dismiss_completion();
             return true;
@@ -802,6 +847,229 @@ impl App {
             return true;
         }
         false
+    }
+
+    // ── find / replace / go-to-line ─────────────────────────────────────────
+
+    /// Opens the inline find bar (A5/B2). When `replace` is true the replace
+    /// row is shown (Ctrl+H). Seeds the query from a single-line selection.
+    fn open_find(&mut self, replace: bool) {
+        self.goto_open = false;
+        // Seed from the current selection if it's a single-line, non-empty span.
+        let sel = self.editor.primary();
+        if !sel.is_empty() {
+            let (s, e) = (sel.start(), sel.end());
+            let text = self.editor.buffer().slice_to_string(s..e);
+            if !text.contains('\n') {
+                self.find.query = text;
+                self.find.focus_replace = false;
+            }
+        }
+        self.find_open = true;
+        self.find.show_replace = replace;
+        if replace {
+            self.find.focus_replace = false;
+        }
+        self.recompute_find();
+        self.find_select_from_caret();
+    }
+
+    /// Rescans the buffer for the current query, rebuilding `find.matches`.
+    /// Case-insensitive matching uses ASCII lowercasing, which preserves byte
+    /// length so rope byte→char mapping stays exact.
+    fn recompute_find(&mut self) {
+        self.find.matches.clear();
+        if self.find.query.is_empty() {
+            self.find.current = None;
+            return;
+        }
+        let rope = self.editor.buffer().rope().clone();
+        let text = rope.to_string();
+        let (hay, needle) = if self.find.case_sensitive {
+            (text, self.find.query.clone())
+        } else {
+            (text.to_ascii_lowercase(), self.find.query.to_ascii_lowercase())
+        };
+        let nbytes = needle.len();
+        if nbytes == 0 {
+            self.find.current = None;
+            return;
+        }
+        let bytes = hay.as_bytes();
+        let mut start = 0;
+        while let Some(rel) = hay[start..].find(&needle) {
+            let b = start + rel;
+            let before_ok = b == 0 || !is_word_byte(bytes[b - 1]);
+            let after_ok = b + nbytes >= bytes.len() || !is_word_byte(bytes[b + nbytes]);
+            if !self.find.whole_word || (before_ok && after_ok) {
+                let cs = rope.byte_to_char(b);
+                let ce = rope.byte_to_char(b + nbytes);
+                self.find.matches.push((cs, ce));
+            }
+            start = b + nbytes;
+        }
+        if self.find.matches.is_empty() {
+            self.find.current = None;
+        } else if let Some(cur) = self.find.current {
+            self.find.current = Some(cur.min(self.find.matches.len() - 1));
+        }
+    }
+
+    /// Selects the first match at or after the caret (wrapping to the first).
+    fn find_select_from_caret(&mut self) {
+        if self.find.matches.is_empty() {
+            self.find.current = None;
+            return;
+        }
+        let caret = self.editor.primary().head;
+        let idx = self
+            .find
+            .matches
+            .iter()
+            .position(|&(s, _)| s >= caret)
+            .unwrap_or(0);
+        self.find.current = Some(idx);
+        self.focus_current_match();
+    }
+
+    /// Moves to the next (`forward`) or previous match, wrapping around.
+    fn find_next(&mut self, forward: bool) {
+        let n = self.find.matches.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.find.current.unwrap_or(0);
+        let next = if forward { (cur + 1) % n } else { (cur + n - 1) % n };
+        self.find.current = Some(next);
+        self.focus_current_match();
+    }
+
+    /// Scrolls to and selects the current match in the editor.
+    fn focus_current_match(&mut self) {
+        if let Some(i) = self.find.current
+            && let Some(&(s, e)) = self.find.matches.get(i)
+        {
+            self.editor.set_selection(s, e);
+            self.ensure_visible = true;
+        }
+    }
+
+    /// Replaces the current match with the replacement text (B2), then advances.
+    fn replace_current(&mut self) {
+        let Some(i) = self.find.current else { return };
+        let Some(&(s, e)) = self.find.matches.get(i) else { return };
+        let replacement = self.find.replace.clone();
+        self.editor.replace_ranges(&[(s, e)], &replacement);
+        self.doc_dirty = true;
+        self.modified = true;
+        self.ensure_visible = true;
+        self.recompute_find();
+        if !self.find.matches.is_empty() {
+            let n = self.find.matches.len();
+            self.find.current = Some(i.min(n - 1));
+            self.focus_current_match();
+        }
+    }
+
+    /// Replaces every match in one undo-able step (B2).
+    fn replace_all(&mut self) {
+        if self.find.matches.is_empty() {
+            return;
+        }
+        let count = self.find.matches.len();
+        let ranges = self.find.matches.clone();
+        let replacement = self.find.replace.clone();
+        self.editor.replace_ranges(&ranges, &replacement);
+        self.doc_dirty = true;
+        self.modified = true;
+        self.ensure_visible = true;
+        self.recompute_find();
+        self.toast(&format!("Replaced {count} occurrence(s)"));
+    }
+
+    /// Routes a key event to the find bar. Returns whether it was handled.
+    fn on_find_key(&mut self, event: &KeyEvent, ctrl: bool, shift: bool) -> bool {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.find_open = false;
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.find_next(!shift);
+                true
+            }
+            Key::Named(NamedKey::Tab) if self.find.show_replace => {
+                self.find.focus_replace = !self.find.focus_replace;
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if self.find.focus_replace {
+                    self.find.replace.pop();
+                } else if self.find.query.pop().is_some() {
+                    self.recompute_find();
+                    self.find_select_from_caret();
+                }
+                true
+            }
+            Key::Character(_) if ctrl => false,
+            Key::Character(s) => {
+                if self.find.focus_replace {
+                    self.find.replace.push_str(s);
+                } else {
+                    self.find.query.push_str(s);
+                    self.recompute_find();
+                    self.find_select_from_caret();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Opens the go-to-line prompt (B3).
+    fn open_goto(&mut self) {
+        self.find_open = false;
+        self.goto_open = true;
+        self.goto_query.clear();
+    }
+
+    /// Routes a key event to the go-to-line prompt.
+    fn on_goto_key(&mut self, event: &KeyEvent, ctrl: bool) -> bool {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.goto_open = false;
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.commit_goto();
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                self.goto_query.pop();
+                true
+            }
+            Key::Character(_) if ctrl => false,
+            Key::Character(s) => {
+                for ch in s.chars().filter(char::is_ascii_digit) {
+                    self.goto_query.push(ch);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Jumps the caret to the 1-based line typed into the go-to prompt (B3).
+    fn commit_goto(&mut self) {
+        self.goto_open = false;
+        let Ok(line_1) = self.goto_query.trim().parse::<usize>() else {
+            return;
+        };
+        let max_line = self.editor.buffer().len_lines().max(1);
+        let line = line_1.saturating_sub(1).min(max_line - 1);
+        let at = self.editor.buffer().line_to_char(line);
+        self.editor.set_selection(at, at);
+        self.ensure_visible = true;
     }
 
     fn on_command(&mut self, key: &str, shift: bool) -> bool {
@@ -888,6 +1156,18 @@ impl App {
             }
             ("f" | "F", true) => {
                 self.search_open = !self.search_open;
+                true
+            }
+            ("f" | "F", false) => {
+                self.open_find(false);
+                true
+            }
+            ("h" | "H", false) => {
+                self.open_find(true);
+                true
+            }
+            ("g" | "G", false) => {
+                self.open_goto();
                 true
             }
             (" ", false) => {
@@ -1647,6 +1927,44 @@ impl App {
             return true;
         }
 
+        // Find-bar buttons (Ctrl+F / Ctrl+H).
+        if self.find_open
+            && let Some(hits) = self.find_hits
+        {
+            if hits.close.contains(point) {
+                self.find_open = false;
+                return true;
+            }
+            if hits.next.contains(point) {
+                self.find_next(true);
+                return true;
+            }
+            if hits.prev.contains(point) {
+                self.find_next(false);
+                return true;
+            }
+            if hits.case.contains(point) {
+                self.find.case_sensitive = !self.find.case_sensitive;
+                self.recompute_find();
+                self.find_select_from_caret();
+                return true;
+            }
+            if hits.word.contains(point) {
+                self.find.whole_word = !self.find.whole_word;
+                self.recompute_find();
+                self.find_select_from_caret();
+                return true;
+            }
+            if self.find.show_replace && hits.replace_one.contains(point) {
+                self.replace_current();
+                return true;
+            }
+            if self.find.show_replace && hits.replace_all.contains(point) {
+                self.replace_all();
+                return true;
+            }
+        }
+
         // Click in the editor canvas → place caret at the clicked line/column.
         if let (Some(chrome), Some(text)) = (&self.chrome, &self.text) {
             let area = chrome.editor_rect();
@@ -2017,6 +2335,8 @@ impl App {
                     },
                     gutter_marks: &gutter_marks,
                     diff_marks: &diff_marks,
+                    find_matches: if self.find_open { &self.find.matches } else { &[] },
+                    find_current: if self.find_open { self.find.current } else { None },
                 },
             );
         }
@@ -2216,6 +2536,49 @@ impl App {
                     selected: state.selected,
                 },
                 &chrome.palette(),
+                self.scale,
+            );
+        }
+
+        // Inline find / replace bar (Ctrl+F / Ctrl+H) — pinned to editor bottom.
+        if self.find_open
+            && let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome)
+        {
+            let palette = chrome.palette();
+            let area = chrome.editor_rect();
+            let hits = text.paint_find_bar(
+                &mut self.scene,
+                area,
+                &FindBarView {
+                    query: &self.find.query,
+                    replace: &self.find.replace,
+                    show_replace: self.find.show_replace,
+                    focus_replace: self.find.focus_replace,
+                    match_count: self.find.matches.len(),
+                    current: self.find.current.map_or(0, |c| c + 1),
+                    case_sensitive: self.find.case_sensitive,
+                    whole_word: self.find.whole_word,
+                },
+                &palette,
+                self.scale,
+            );
+            self.find_hits = Some(hits);
+        } else {
+            self.find_hits = None;
+        }
+
+        // Go-to-line prompt (Ctrl+G) — centred, topmost.
+        if self.goto_open
+            && let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome)
+        {
+            let palette = chrome.palette();
+            let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+            text.paint_input_prompt(
+                &mut self.scene,
+                screen,
+                "Go to line",
+                &self.goto_query,
+                &palette,
                 self.scale,
             );
         }

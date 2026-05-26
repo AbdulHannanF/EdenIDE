@@ -570,6 +570,32 @@ impl Editor {
         true
     }
 
+    /// Replaces every range in `ranges` with `replacement` as a single undo
+    /// step (used by find-and-replace "Replace All"). Ranges are applied
+    /// back-to-front so earlier indices stay valid.
+    pub fn replace_ranges(&mut self, ranges: &[(usize, usize)], replacement: &str) {
+        if ranges.is_empty() {
+            return;
+        }
+        self.history.break_run();
+        self.history.record(self.buffer.rope(), &self.selections, EditKind::Other);
+        let mut sorted: Vec<(usize, usize)> = ranges.to_vec();
+        sorted.sort_by_key(|r| std::cmp::Reverse(r.0));
+        let mut last_start = self.len();
+        for (s, e) in sorted {
+            let (s, e) = (s.min(self.len()), e.min(self.len()));
+            if s > e {
+                continue;
+            }
+            self.buffer.remove(s..e);
+            self.buffer.insert(s, replacement);
+            last_start = s;
+        }
+        let caret = (last_start + replacement.chars().count()).min(self.len());
+        self.selections = vec![Selection::caret(caret)];
+        self.normalize();
+    }
+
     /// Restores the selection after a per-line edit: covers the whole block for
     /// a multi-line selection, or places a caret at `head_col` on the (single)
     /// touched line when the original selection was an empty caret.
@@ -865,6 +891,17 @@ mod tests {
         e.set_caret(2); // line 1 "b"
         e.move_lines(true);
         assert_eq!(text(&e), "a\nc\nb");
+    }
+
+    #[test]
+    fn replace_ranges_is_single_undo() {
+        let mut e = Editor::from_text("foo foo foo");
+        // Ranges of all three "foo".
+        e.replace_ranges(&[(0, 3), (4, 7), (8, 11)], "bar");
+        assert_eq!(text(&e), "bar bar bar");
+        // One undo restores everything.
+        assert!(e.undo());
+        assert_eq!(text(&e), "foo foo foo");
     }
 
     #[test]
