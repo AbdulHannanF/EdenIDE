@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use cosmic_text::fontdb;
 use cosmic_text::{Attrs, Buffer as CtBuffer, Family, FontSystem, Metrics, Shaping, Weight};
 use eden_editor::Editor;
-use eden_theme::{Palette, Rgba8};
+use eden_syntax::{HighlightKind, Highlights};
+use eden_theme::{Palette, Rgba8, Syntax};
 use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Blob, Fill, FontData};
 use vello::{Glyph, Scene};
@@ -45,6 +46,10 @@ pub struct EditorFrame<'a> {
     pub editor: &'a Editor,
     /// The palette (interpolated mid-crossfade).
     pub palette: &'a Palette,
+    /// The syntax colours (interpolated mid-crossfade).
+    pub syntax: &'a Syntax,
+    /// Highlight spans for the whole document.
+    pub highlights: &'a Highlights,
     /// Vertical scroll offset in physical pixels (clamped internally).
     pub scroll_px: f64,
     /// Display scale factor.
@@ -148,6 +153,8 @@ impl TextSystem {
             area,
             editor,
             palette,
+            syntax,
+            highlights,
             scroll_px,
             scale,
             show_caret,
@@ -212,14 +219,37 @@ impl TextSystem {
             None,
             (rows as f64 * line_h) as f32,
         );
+        let rope = buffer.rope();
+        let total_chars = buffer.len_chars();
+        // Colour each glyph by the highlight kind at its character. Monospace, so
+        // the glyph index within a run equals the column (good enough for code;
+        // tabs/grapheme clusters are a known approximation).
         let runs: Vec<RunData> = self
             .text_buf
             .layout_runs()
-            .map(RunData::from_run)
+            .enumerate()
+            .map(|(i, run)| {
+                let line_start = buffer.line_to_char(first_line + i);
+                let glyphs = run
+                    .glyphs
+                    .iter()
+                    .enumerate()
+                    .map(|(col, g)| {
+                        let char_idx = line_start + col;
+                        let kind = if char_idx < total_chars {
+                            highlights.kind_at(rope.char_to_byte(char_idx))
+                        } else {
+                            HighlightKind::Default
+                        };
+                        GlyphData::new(g, syntax_color(syntax, kind, palette.text))
+                    })
+                    .collect();
+                RunData { line_y: run.line_y, glyphs }
+            })
             .collect();
         let origin_y = area.y0 - frac;
         for run in &runs {
-            self.draw_glyphs(scene, &run.glyphs, text_x, origin_y + f64::from(run.line_y), palette.text);
+            self.draw_glyphs(scene, &run.glyphs, text_x, origin_y + f64::from(run.line_y));
         }
 
         // Line numbers, right-aligned in the gutter.
@@ -235,11 +265,18 @@ impl TextSystem {
             None,
             (rows as f64 * line_h) as f32,
         );
-        let number_runs: Vec<RunData> = self.aux_buf.layout_runs().map(RunData::from_run).collect();
-        let number_x = area.x0 + 12.0 * scale;
         let number_color = with_alpha(palette.text_muted, 0xB0);
+        let number_runs: Vec<RunData> = self
+            .aux_buf
+            .layout_runs()
+            .map(|run| RunData {
+                line_y: run.line_y,
+                glyphs: run.glyphs.iter().map(|g| GlyphData::new(g, number_color)).collect(),
+            })
+            .collect();
+        let number_x = area.x0 + 12.0 * scale;
         for run in &number_runs {
-            self.draw_glyphs(scene, &run.glyphs, number_x, origin_y + f64::from(run.line_y), number_color);
+            self.draw_glyphs(scene, &run.glyphs, number_x, origin_y + f64::from(run.line_y));
         }
 
         // Carets on top.
@@ -265,13 +302,14 @@ impl TextSystem {
         scroll
     }
 
-    fn draw_glyphs(&mut self, scene: &mut Scene, glyphs: &[GlyphData], origin_x: f64, baseline: f64, color: Rgba8) {
-        let brush = to_color(color);
+    fn draw_glyphs(&mut self, scene: &mut Scene, glyphs: &[GlyphData], origin_x: f64, baseline: f64) {
+        // Batch consecutive glyphs that share both font and colour into one run.
         let mut i = 0;
         while i < glyphs.len() {
             let font_id = glyphs[i].font_id;
+            let color = glyphs[i].color;
             let start = i;
-            while i < glyphs.len() && glyphs[i].font_id == font_id {
+            while i < glyphs.len() && glyphs[i].font_id == font_id && glyphs[i].color == color {
                 i += 1;
             }
             let Some(font) = self.font_for(font_id) else {
@@ -281,7 +319,7 @@ impl TextSystem {
             scene
                 .draw_glyphs(&font)
                 .font_size(self.font_size_px as f32)
-                .brush(brush)
+                .brush(to_color(color))
                 .transform(Affine::translate((origin_x, baseline)))
                 .draw(
                     Fill::NonZero,
@@ -295,6 +333,23 @@ impl TextSystem {
     }
 }
 
+/// Maps a tree-sitter highlight kind to a theme syntax colour.
+fn syntax_color(syntax: &Syntax, kind: HighlightKind, default: Rgba8) -> Rgba8 {
+    match kind {
+        HighlightKind::Keyword | HighlightKind::Label => syntax.keyword,
+        HighlightKind::Function => syntax.function,
+        HighlightKind::Type | HighlightKind::Constructor => syntax.type_,
+        HighlightKind::Property | HighlightKind::Variable => syntax.variable,
+        HighlightKind::Constant => syntax.constant,
+        HighlightKind::String | HighlightKind::Escape => syntax.string,
+        HighlightKind::Comment => syntax.comment,
+        HighlightKind::Operator => syntax.operator,
+        HighlightKind::Punctuation => syntax.punctuation,
+        HighlightKind::Attribute => syntax.attribute,
+        HighlightKind::Default => default,
+    }
+}
+
 /// A copy of the per-glyph data we need, decoupled from cosmic-text's borrow so
 /// we can shape into `text_buf` and then draw without holding an immutable
 /// borrow of `self` across the mutable `font_for` calls.
@@ -303,27 +358,22 @@ struct GlyphData {
     glyph_id: u16,
     x: f32,
     y: f32,
+    color: Rgba8,
+}
+
+impl GlyphData {
+    fn new(glyph: &cosmic_text::LayoutGlyph, color: Rgba8) -> Self {
+        Self {
+            font_id: glyph.font_id,
+            glyph_id: glyph.glyph_id,
+            x: glyph.x,
+            y: glyph.y,
+            color,
+        }
+    }
 }
 
 struct RunData {
     line_y: f32,
     glyphs: Vec<GlyphData>,
-}
-
-impl RunData {
-    fn from_run(run: cosmic_text::LayoutRun<'_>) -> Self {
-        Self {
-            line_y: run.line_y,
-            glyphs: run
-                .glyphs
-                .iter()
-                .map(|g| GlyphData {
-                    font_id: g.font_id,
-                    glyph_id: g.glyph_id,
-                    x: g.x,
-                    y: g.y,
-                })
-                .collect(),
-        }
-    }
 }

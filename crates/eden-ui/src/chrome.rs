@@ -2,7 +2,7 @@
 //! canvas, and status bar — laid out with taffy, themed, and animated.
 
 use eden_motion::{MotionPrefs, Spring, SpringConfig};
-use eden_theme::{Palette, Theme};
+use eden_theme::{Palette, Syntax, Theme};
 use taffy::prelude::{auto, length, percent};
 use taffy::{
     AvailableSpace, Display, FlexDirection, NodeId, Size as TaffySize, Style, TaffyTree,
@@ -84,6 +84,7 @@ pub struct Chrome {
     themes: Vec<Theme>,
     active_theme: usize,
     prev_palette: Palette,
+    prev_syntax: Syntax,
     theme_mix: Spring,
 
     hover: Spring,
@@ -124,6 +125,7 @@ impl Chrome {
 
         let themes = Theme::builtins().to_vec();
         let day = themes[0].palette;
+        let day_syntax = themes[0].syntax;
 
         let mut chrome = Self {
             tree,
@@ -146,6 +148,7 @@ impl Chrome {
             themes,
             active_theme: 0,
             prev_palette: day,
+            prev_syntax: day_syntax,
             // At rest at 1.0 so the displayed palette is exactly the active theme.
             theme_mix: Spring::with_config(1.0, prefs.resolve(SpringConfig::UNIT)),
             hover: Spring::with_config(0.0, prefs.resolve(SpringConfig::SNAPPY)),
@@ -202,6 +205,7 @@ impl Chrome {
     /// Advances to the next built-in theme, crossfading the palette.
     pub fn cycle_theme(&mut self) {
         self.prev_palette = self.displayed_palette();
+        self.prev_syntax = self.displayed_syntax();
         self.active_theme = (self.active_theme + 1) % self.themes.len();
         self.theme_mix = Spring::with_config(0.0, self.prefs.resolve(SpringConfig::UNIT));
         if self.prefs.reduce_motion {
@@ -261,6 +265,12 @@ impl Chrome {
         self.displayed_palette()
     }
 
+    /// The syntax colours currently being displayed (interpolated mid-crossfade).
+    #[must_use]
+    pub fn syntax(&self) -> Syntax {
+        self.displayed_syntax()
+    }
+
     /// The absolute rect of the editor canvas, where text is drawn.
     #[must_use]
     pub fn editor_rect(&self) -> Rect {
@@ -318,6 +328,11 @@ impl Chrome {
     fn displayed_palette(&self) -> Palette {
         self.prev_palette
             .lerp(self.themes[self.active_theme].palette, self.theme_mix.value())
+    }
+
+    fn displayed_syntax(&self) -> Syntax {
+        self.prev_syntax
+            .lerp(self.themes[self.active_theme].syntax, self.theme_mix.value())
     }
 
     fn hover_for(&self, region: Region) -> f64 {

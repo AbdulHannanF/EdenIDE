@@ -71,15 +71,62 @@ impl Palette {
     }
 }
 
-/// A complete theme: identity plus a colour [`Palette`].
+/// Per-category syntax-highlighting colours. The UI maps tree-sitter highlight
+/// kinds onto these fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Syntax {
+    /// Language keywords.
+    pub keyword: Rgba8,
+    /// Function and method names.
+    pub function: Rgba8,
+    /// Types and type-like constructors.
+    pub type_: Rgba8,
+    /// Variables, parameters, fields.
+    pub variable: Rgba8,
+    /// Constants and builtins.
+    pub constant: Rgba8,
+    /// String literals (and escapes).
+    pub string: Rgba8,
+    /// Comments.
+    pub comment: Rgba8,
+    /// Operators.
+    pub operator: Rgba8,
+    /// Brackets, delimiters, punctuation.
+    pub punctuation: Rgba8,
+    /// Attributes / annotations.
+    pub attribute: Rgba8,
+}
+
+impl Syntax {
+    /// Interpolates every colour toward `other` by `t` (clamped `0.0..=1.0`).
+    #[must_use]
+    pub fn lerp(self, other: Self, t: f64) -> Self {
+        Self {
+            keyword: self.keyword.lerp(other.keyword, t),
+            function: self.function.lerp(other.function, t),
+            type_: self.type_.lerp(other.type_, t),
+            variable: self.variable.lerp(other.variable, t),
+            constant: self.constant.lerp(other.constant, t),
+            string: self.string.lerp(other.string, t),
+            comment: self.comment.lerp(other.comment, t),
+            operator: self.operator.lerp(other.operator, t),
+            punctuation: self.punctuation.lerp(other.punctuation, t),
+            attribute: self.attribute.lerp(other.attribute, t),
+        }
+    }
+}
+
+/// A complete theme: identity plus colour [`Palette`] and [`Syntax`] tables.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Theme {
     /// Human-readable name, e.g. `"Eden Day"`.
     pub name: String,
     /// Light or dark.
     pub appearance: Appearance,
-    /// The colour palette.
+    /// The chrome colour palette.
     pub palette: Palette,
+    /// The syntax-highlighting colours.
+    pub syntax: Syntax,
 }
 
 impl Theme {
@@ -128,6 +175,18 @@ impl Theme {
                 tab_active: Rgba8::rgb(0xFB, 0xF8, 0xF3),
                 selection: Rgba8::rgba(0x2A, 0x6B, 0xC8, 0x24),
             },
+            syntax: Syntax {
+                keyword: Rgba8::rgb(0x8A, 0x4F, 0xA0),
+                function: Rgba8::rgb(0x2A, 0x6B, 0xC8),
+                type_: Rgba8::rgb(0x2E, 0x7D, 0x6E),
+                variable: Rgba8::rgb(0x2A, 0x2A, 0x30),
+                constant: Rgba8::rgb(0xB2, 0x5E, 0x2A),
+                string: Rgba8::rgb(0x3E, 0x7D, 0x44),
+                comment: Rgba8::rgb(0x8A, 0x85, 0x7A),
+                operator: Rgba8::rgb(0x6B, 0x68, 0x62),
+                punctuation: Rgba8::rgb(0x6B, 0x68, 0x62),
+                attribute: Rgba8::rgb(0x9A, 0x6B, 0x2C),
+            },
         }
     }
 
@@ -150,6 +209,18 @@ impl Theme {
                 tab_active: Rgba8::rgb(0x1A, 0x1F, 0x2E),
                 selection: Rgba8::rgba(0x3E, 0x9C, 0x92, 0x2E),
             },
+            syntax: Syntax {
+                keyword: Rgba8::rgb(0xC7, 0x92, 0xDB),
+                function: Rgba8::rgb(0x6F, 0xB8, 0xC9),
+                type_: Rgba8::rgb(0x7F, 0xC9, 0xA6),
+                variable: Rgba8::rgb(0xE6, 0xE4, 0xDC),
+                constant: Rgba8::rgb(0xE0, 0xA6, 0x6B),
+                string: Rgba8::rgb(0x9C, 0xC7, 0x8A),
+                comment: Rgba8::rgb(0x5E, 0x66, 0x75),
+                operator: Rgba8::rgb(0xA6, 0xAB, 0xBA),
+                punctuation: Rgba8::rgb(0x8A, 0x8E, 0x9A),
+                attribute: Rgba8::rgb(0xD8, 0xB2, 0x6B),
+            },
         }
     }
 
@@ -171,6 +242,18 @@ impl Theme {
                 accent_soft: Rgba8::rgb(0xB8, 0x86, 0x2F),
                 tab_active: Rgba8::rgb(0x0E, 0x0E, 0x10),
                 selection: Rgba8::rgba(0xD9, 0xA4, 0x41, 0x26),
+            },
+            syntax: Syntax {
+                keyword: Rgba8::rgb(0xD9, 0xA4, 0x41),
+                function: Rgba8::rgb(0xC9, 0xC4, 0xB8),
+                type_: Rgba8::rgb(0xB8, 0xA9, 0x8C),
+                variable: Rgba8::rgb(0xED, 0xED, 0xEA),
+                constant: Rgba8::rgb(0xD9, 0xA4, 0x41),
+                string: Rgba8::rgb(0x9A, 0xA8, 0x8C),
+                comment: Rgba8::rgb(0x5C, 0x5C, 0x60),
+                operator: Rgba8::rgb(0x9A, 0x9A, 0x90),
+                punctuation: Rgba8::rgb(0x7A, 0x7A, 0x80),
+                attribute: Rgba8::rgb(0xB8, 0x86, 0x2F),
             },
         }
     }

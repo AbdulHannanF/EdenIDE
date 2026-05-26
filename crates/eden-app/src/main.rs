@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use eden_motion::{MotionPrefs, Spring, SpringConfig};
-use eden_ui::{Chrome, Editor, EditorFrame, TextSystem};
+use eden_ui::{Chrome, Editor, EditorFrame, Highlighter, Highlights, TextSystem};
 use vello::kurbo::Point;
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
@@ -63,6 +63,9 @@ struct App {
     chrome: Option<Chrome>,
     text: Option<TextSystem>,
     editor: Editor,
+    highlighter: Option<Highlighter>,
+    highlights: Highlights,
+    doc_dirty: bool,
     scroll: Spring,
     prefs: MotionPrefs,
     mods: ModifiersState,
@@ -93,6 +96,9 @@ impl App {
             chrome: None,
             text: None,
             editor: Editor::from_text(SAMPLE),
+            highlighter: Highlighter::rust().ok(),
+            highlights: Highlights::default(),
+            doc_dirty: true,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             prefs: MotionPrefs::from_env(),
             mods: ModifiersState::empty(),
@@ -185,6 +191,7 @@ impl App {
             Key::Character(s) if ctrl => self.on_command(s),
             Key::Character(s) => {
                 self.editor.insert(s);
+                self.doc_dirty = true;
                 self.ensure_visible = true;
                 true
             }
@@ -194,17 +201,17 @@ impl App {
 
     fn on_named_key(&mut self, named: NamedKey, shift: bool) -> bool {
         match named {
-            NamedKey::Enter => self.edit(|e| e.insert("\n")),
-            NamedKey::Tab => self.edit(|e| e.insert("    ")),
-            NamedKey::Backspace => self.edit(Editor::backspace),
-            NamedKey::Delete => self.edit(Editor::delete_forward),
-            NamedKey::Space => self.edit(|e| e.insert(" ")),
-            NamedKey::ArrowLeft => self.edit(|e| e.move_left(shift)),
-            NamedKey::ArrowRight => self.edit(|e| e.move_right(shift)),
-            NamedKey::ArrowUp => self.edit(|e| e.move_up(shift)),
-            NamedKey::ArrowDown => self.edit(|e| e.move_down(shift)),
-            NamedKey::Home => self.edit(|e| e.move_line_start(shift)),
-            NamedKey::End => self.edit(|e| e.move_line_end(shift)),
+            NamedKey::Enter => self.edit(true, |e| e.insert("\n")),
+            NamedKey::Tab => self.edit(true, |e| e.insert("    ")),
+            NamedKey::Backspace => self.edit(true, Editor::backspace),
+            NamedKey::Delete => self.edit(true, Editor::delete_forward),
+            NamedKey::Space => self.edit(true, |e| e.insert(" ")),
+            NamedKey::ArrowLeft => self.edit(false, |e| e.move_left(shift)),
+            NamedKey::ArrowRight => self.edit(false, |e| e.move_right(shift)),
+            NamedKey::ArrowUp => self.edit(false, |e| e.move_up(shift)),
+            NamedKey::ArrowDown => self.edit(false, |e| e.move_down(shift)),
+            NamedKey::Home => self.edit(false, |e| e.move_line_start(shift)),
+            NamedKey::End => self.edit(false, |e| e.move_line_end(shift)),
             NamedKey::PageUp => {
                 self.scroll_by_page(-1.0);
                 true
@@ -231,22 +238,40 @@ impl App {
                 }
                 true
             }
-            "z" | "Z" => self.edit(|e| {
+            "z" | "Z" => self.edit(true, |e| {
                 e.undo();
             }),
-            "y" | "Y" => self.edit(|e| {
+            "y" | "Y" => self.edit(true, |e| {
                 e.redo();
             }),
-            "a" | "A" => self.edit(Editor::select_all),
+            "a" | "A" => self.edit(false, Editor::select_all),
             _ => false,
         }
     }
 
-    /// Runs an editor mutation and schedules a scroll-to-caret.
-    fn edit(&mut self, action: impl FnOnce(&mut Editor)) -> bool {
+    /// Runs an editor action and schedules a scroll-to-caret. `mutates` marks
+    /// the document dirty so highlights are recomputed before the next paint.
+    fn edit(&mut self, mutates: bool, action: impl FnOnce(&mut Editor)) -> bool {
         action(&mut self.editor);
+        if mutates {
+            self.doc_dirty = true;
+        }
         self.ensure_visible = true;
         true
+    }
+
+    /// Recomputes syntax highlights if the document changed since last paint.
+    fn refresh_highlights(&mut self) {
+        if !self.doc_dirty {
+            return;
+        }
+        self.doc_dirty = false;
+        if let Some(highlighter) = &mut self.highlighter {
+            // Full reparse on change. tree-sitter is fast for typical files;
+            // incremental edits (InputEdit) are a documented follow-up.
+            let source = self.editor.buffer().to_string();
+            self.highlights = Highlights::new(highlighter.highlight(&source));
+        }
     }
 
     fn scroll_by_page(&mut self, pages: f64) {
@@ -295,6 +320,7 @@ impl App {
     }
 
     fn render(&mut self) -> Result<()> {
+        self.refresh_highlights();
         self.clamp_scroll();
         self.ensure_caret_visible();
 
@@ -330,12 +356,15 @@ impl App {
         }
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let palette = chrome.palette();
+            let syntax = chrome.syntax();
             text.paint_editor(
                 &mut self.scene,
                 &EditorFrame {
                     area: chrome.editor_rect(),
                     editor: &self.editor,
                     palette: &palette,
+                    syntax: &syntax,
+                    highlights: &self.highlights,
                     scroll_px: self.scroll.value(),
                     scale: self.scale,
                     show_caret: self.focused,

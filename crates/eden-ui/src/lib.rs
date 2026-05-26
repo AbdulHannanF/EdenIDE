@@ -17,5 +17,7 @@ pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TitleBar};
 pub use text::{EditorFrame, TextSystem};
 pub use widget::{PaintCtx, Widget};
 
-// Re-exported so callers can build/drive an editor without a direct dependency.
+// Re-exported so callers can build/drive an editor and highlighter without
+// direct dependencies on the lower crates.
 pub use eden_editor::Editor;
+pub use eden_syntax::{HighlightKind, Highlighter, Highlights, Span};
