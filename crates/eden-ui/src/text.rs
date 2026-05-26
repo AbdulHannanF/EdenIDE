@@ -17,7 +17,7 @@ use vello::kurbo::{Affine, Rect};
 use vello::peniko::{Blob, Fill, FontData};
 use vello::{Glyph, Scene};
 
-use crate::paint::{fill_rect, to_color};
+use crate::paint::{fill_rect, fill_rrect, to_color};
 
 // design: editor type at 14px logical, line height 1.55 (§6: "never compress").
 const FONT_SIZE: f64 = 14.0;
@@ -56,6 +56,16 @@ pub struct EditorFrame<'a> {
     pub scale: f64,
     /// Whether to draw carets (typically: window focused).
     pub show_caret: bool,
+}
+
+/// The command-palette content to render.
+pub struct PaletteView<'a> {
+    /// The current query text.
+    pub query: &'a str,
+    /// The result rows (already filtered and ranked), top-first.
+    pub entries: &'a [String],
+    /// The index of the highlighted row.
+    pub selected: usize,
 }
 
 /// Owns the font system and shaping buffers, and draws editor content.
@@ -300,6 +310,86 @@ impl TextSystem {
 
         scene.pop_layer();
         scroll
+    }
+
+    /// Draws a single line of UI text with its baseline at `baseline`.
+    pub fn draw_text(&mut self, scene: &mut Scene, text: &str, x: f64, baseline: f64, color: Rgba8) {
+        shape_buffer(&mut self.aux_buf, &mut self.font_system, text, None, self.line_h as f32);
+        let runs: Vec<RunData> = self
+            .aux_buf
+            .layout_runs()
+            .map(|run| RunData {
+                line_y: run.line_y,
+                glyphs: run.glyphs.iter().map(|g| GlyphData::new(g, color)).collect(),
+            })
+            .collect();
+        for run in &runs {
+            self.draw_glyphs(scene, &run.glyphs, x, baseline);
+        }
+    }
+
+    /// Paints the Cmd-P style command palette as a floating overlay over
+    /// `screen`. Returns the number of result rows actually drawn.
+    pub fn paint_palette(
+        &mut self,
+        scene: &mut Scene,
+        screen: Rect,
+        view: &PaletteView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) -> usize {
+        self.ensure_metrics(scale);
+        // Scrim to push the editor back.
+        fill_rect(scene, screen, Rgba8::rgba(0, 0, 0, 0x4D));
+
+        let row_h = 30.0 * scale;
+        let query_h = 44.0 * scale;
+        let max_rows = 12usize;
+        let shown = view.entries.len().min(max_rows);
+
+        let width = (screen.width() * 0.6).clamp(360.0 * scale, 760.0 * scale);
+        let height = query_h + shown as f64 * row_h + 12.0 * scale;
+        let x0 = screen.x0 + (screen.width() - width) / 2.0;
+        let y0 = screen.y0 + 76.0 * scale;
+        let panel = Rect::new(x0, y0, x0 + width, y0 + height);
+
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &panel);
+        fill_rrect(scene, panel, 12.0 * scale, palette.surface_raised);
+
+        let pad = 18.0 * scale;
+        // Query line.
+        let query_baseline = y0 + query_h * 0.64;
+        let prompt = if view.query.is_empty() {
+            "Open file…".to_string()
+        } else {
+            view.query.to_string()
+        };
+        let prompt_color = if view.query.is_empty() {
+            with_alpha(palette.text_muted, 0xC0)
+        } else {
+            palette.text
+        };
+        self.draw_text(scene, &prompt, x0 + pad, query_baseline, prompt_color);
+        // Divider under the query.
+        let div = (scale).max(1.0);
+        fill_rect(scene, Rect::new(x0, y0 + query_h, x0 + width, y0 + query_h + div), palette.divider);
+
+        // Result rows.
+        for (i, entry) in view.entries.iter().take(shown).enumerate() {
+            let row_top = y0 + query_h + i as f64 * row_h;
+            if i == view.selected {
+                fill_rect(scene, Rect::new(x0, row_top, x0 + width, row_top + row_h), palette.selection);
+            }
+            let color = if i == view.selected {
+                palette.text
+            } else {
+                with_alpha(palette.text, 0xCC)
+            };
+            self.draw_text(scene, entry, x0 + pad, row_top + row_h * 0.66, color);
+        }
+
+        scene.pop_layer();
+        shown
     }
 
     fn draw_glyphs(&mut self, scene: &mut Scene, glyphs: &[GlyphData], origin_x: f64, baseline: f64) {

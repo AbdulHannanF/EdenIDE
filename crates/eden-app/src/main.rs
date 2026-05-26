@@ -14,8 +14,10 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use eden_motion::{MotionPrefs, Spring, SpringConfig};
-use eden_ui::{Chrome, Editor, EditorFrame, Highlighter, Highlights, TextSystem};
-use vello::kurbo::Point;
+use eden_search::FuzzyMatcher;
+use eden_ui::{Chrome, Editor, EditorFrame, Highlighter, Highlights, PaletteView, TextSystem};
+use eden_workspace::Project;
+use vello::kurbo::{Point, Rect};
 use vello::peniko::Color;
 use vello::util::{RenderContext, RenderSurface};
 use vello::wgpu;
@@ -66,6 +68,10 @@ struct App {
     highlighter: Option<Highlighter>,
     highlights: Highlights,
     doc_dirty: bool,
+    project: Project,
+    files: Vec<String>,
+    fuzzy: FuzzyMatcher,
+    palette: Option<PaletteState>,
     scroll: Spring,
     prefs: MotionPrefs,
     mods: ModifiersState,
@@ -81,6 +87,14 @@ enum WindowState {
     Active(Box<ActiveWindow>),
 }
 
+/// State of the open Cmd-P fuzzy file finder.
+struct PaletteState {
+    query: String,
+    /// Indices into `App::files`, ranked best-first.
+    results: Vec<usize>,
+    selected: usize,
+}
+
 struct ActiveWindow {
     window: Arc<Window>,
     surface: RenderSurface<'static>,
@@ -88,6 +102,9 @@ struct ActiveWindow {
 
 impl App {
     fn new() -> Self {
+        let root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let project = Project::new(root);
+        let files = project.file_strings();
         Self {
             context: RenderContext::new(),
             renderers: Vec::new(),
@@ -99,6 +116,10 @@ impl App {
             highlighter: Highlighter::rust().ok(),
             highlights: Highlights::default(),
             doc_dirty: true,
+            project,
+            files,
+            fuzzy: FuzzyMatcher::new(),
+            palette: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             prefs: MotionPrefs::from_env(),
             mods: ModifiersState::empty(),
@@ -184,6 +205,9 @@ impl App {
 
     /// Handles a key press. Returns `true` if a repaint is needed.
     fn on_key(&mut self, event: &KeyEvent) -> bool {
+        if self.palette.is_some() {
+            return self.on_palette_key(event);
+        }
         let ctrl = self.mods.control_key() || self.mods.super_key();
         let shift = self.mods.shift_key();
         match &event.logical_key {
@@ -245,8 +269,104 @@ impl App {
                 e.redo();
             }),
             "a" | "A" => self.edit(false, Editor::select_all),
+            "p" | "P" => {
+                self.open_palette();
+                true
+            }
             _ => false,
         }
+    }
+
+    fn open_palette(&mut self) {
+        let results = self.fuzzy.rank("", &self.files);
+        self.palette = Some(PaletteState {
+            query: String::new(),
+            results,
+            selected: 0,
+        });
+    }
+
+    /// Handles a key press while the Cmd-P palette is open.
+    fn on_palette_key(&mut self, event: &KeyEvent) -> bool {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.palette = None;
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.open_selected_file();
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(p) = &mut self.palette {
+                    let count = p.results.len();
+                    if count > 0 {
+                        p.selected = (p.selected + 1) % count;
+                    }
+                }
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if let Some(p) = &mut self.palette {
+                    let count = p.results.len();
+                    if count > 0 {
+                        p.selected = (p.selected + count - 1) % count;
+                    }
+                }
+                true
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(p) = &mut self.palette {
+                    p.query.pop();
+                }
+                self.refilter_palette();
+                true
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(p) = &mut self.palette {
+                    p.query.push(' ');
+                }
+                self.refilter_palette();
+                true
+            }
+            Key::Character(s) => {
+                if let Some(p) = &mut self.palette {
+                    p.query.push_str(s);
+                }
+                self.refilter_palette();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn refilter_palette(&mut self) {
+        if let Some(p) = &mut self.palette {
+            p.results = self.fuzzy.rank(&p.query, &self.files);
+            p.selected = 0;
+        }
+    }
+
+    /// Opens the file currently selected in the palette into the editor.
+    fn open_selected_file(&mut self) {
+        let Some(p) = &self.palette else { return };
+        let Some(&file_idx) = p.results.get(p.selected) else {
+            self.palette = None;
+            return;
+        };
+        let rel = &self.files[file_idx];
+        let path = self.project.root().join(rel);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                self.editor = Editor::from_text(&contents);
+                self.doc_dirty = true;
+                self.scroll.jump_to(0.0);
+                self.ensure_visible = true;
+                tracing::info!(file = %rel, "opened");
+            }
+            Err(err) => tracing::warn!(file = %rel, "could not open: {err}"),
+        }
+        self.palette = None;
     }
 
     /// Runs an editor action and schedules a scroll-to-caret. `mutates` marks
@@ -369,6 +489,24 @@ impl App {
                     scale: self.scale,
                     show_caret: self.focused,
                 },
+            );
+        }
+        if let Some(state) = &self.palette
+            && let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome)
+        {
+            let entries: Vec<String> =
+                state.results.iter().take(12).map(|&i| self.files[i].clone()).collect();
+            let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+            text.paint_palette(
+                &mut self.scene,
+                screen,
+                &PaletteView {
+                    query: &state.query,
+                    entries: &entries,
+                    selected: state.selected,
+                },
+                &chrome.palette(),
+                self.scale,
             );
         }
 

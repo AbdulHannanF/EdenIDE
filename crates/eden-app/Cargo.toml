@@ -17,7 +17,9 @@ workspace = true
 
 [dependencies]
 eden-motion.workspace = true
+eden-search.workspace = true
 eden-ui.workspace = true
+eden-workspace.workspace = true
 anyhow.workspace = true
 pollster = "0.4.0"
 tracing.workspace = true
