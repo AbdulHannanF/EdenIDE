@@ -76,12 +76,23 @@ impl LspPool {
     /// language is opened.
     #[must_use]
     pub fn new(root: &Path) -> Self {
+        // Tokio runtime creation can only fail if OS resource limits are hit
+        // (e.g. too many threads). We log and fall back to a current-thread
+        // runtime, which can never fail, to avoid a panic in library code.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .thread_name("eden-lsp")
             .build()
-            .expect("build LSP tokio runtime");
+            .unwrap_or_else(|err| {
+                tracing::error!("failed to build multi-thread LSP runtime ({err:#}); falling back to current-thread");
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .thread_name("eden-lsp")
+                    .build()
+                    // current_thread build is infallible in practice
+                    .unwrap_or_else(|e| panic!("cannot create any tokio runtime: {e}"))
+            });
         Self {
             runtime,
             rust: OnceLock::new(),

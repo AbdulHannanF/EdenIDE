@@ -106,7 +106,10 @@ impl GitRepo {
         if head.is_branch() {
             head.shorthand().map(|s| s.to_owned())
         } else {
-            head.target().map(|oid| oid.to_string()[..7].to_owned())
+            head.target().map(|oid| {
+                    let s = oid.to_string();
+                    s.get(..7).unwrap_or(&s).to_owned()
+                })
         }
     }
 

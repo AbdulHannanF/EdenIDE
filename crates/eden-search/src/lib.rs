@@ -160,7 +160,9 @@ where
         mat: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         let bytes = mat.bytes();
-        let line = std::str::from_utf8(bytes).unwrap_or("").trim_end_matches('\n');
+        let line = std::str::from_utf8(bytes)
+            .unwrap_or("")
+            .trim_end_matches(['\n', '\r']);
         let (start, end) = self
             .matcher
             .find(bytes)

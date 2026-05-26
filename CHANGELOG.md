@@ -4,11 +4,20 @@ All notable changes to Eden are documented here.
 
 ## Phase 7 — Polish (current)
 
+- **Multiple tabs** — open documents as tabs with per-tab modified dot, click-to-activate, close (×) button, `Ctrl+W` to close, and `Ctrl+Tab` / `Ctrl+PageUp/Down` to cycle. Opening an already-open file focuses its tab.
+- **Inline find/replace** — `Ctrl+F` opens a find bar with match highlighting, prev/next navigation, and case / whole-word toggles; `Ctrl+H` adds a replace row (replace one / replace all in a single undo step).
+- **Go to line** — `Ctrl+G` opens a centred prompt that jumps the caret to a line number.
+- **Top menu bar** — File / Edit / View / Go / Run / Terminal / Help dropdowns in the title strip, wired to real actions, with click and hover-to-switch.
+- **Right-click context menus** — editor (cut/copy/paste, find, go-to-definition), tab strip (close / close others / close all), and sidebar (copy path, reveal in explorer).
+- **Clipboard** — `Ctrl+C` / `Ctrl+X` / `Ctrl+V` via the system clipboard (arboard); paste normalises CRLF.
+- **Save & open** — `Ctrl+S` save, `Ctrl+Shift+S` save-as, `Ctrl+O` open, `Ctrl+N` new file (native file dialogs via rfd).
+- **Eden Nothing** — a fourth built-in theme: pure-black canvas, monochrome syntax ramp, single red accent.
 - **JetBrains Mono** bundled in `assets/fonts/`; loaded at startup with Consolas fallback.
 - **Pulsing caret** — sine-wave brightness cycle at 1.1 s period; bright spike on each keystroke.
 - **Click-to-place caret** — left-click in the editor canvas moves the caret to the clicked position.
 - **Horizontal scrollbar** — 4 px thumb, fades 1.5 s after last scroll event; Shift+scroll or natural horizontal scroll to pan.
 - **Settings panel** — `Ctrl+,` opens a floating panel showing font size, tab width, active theme, and feature toggle states.
+- **Editor operations** — line indent/dedent (`Tab` / `Shift+Tab`), move lines (`Alt+↑/↓`), toggle comment (`Ctrl+/`), select line (`Ctrl+L`), select-next-occurrence (`Ctrl+D`), font zoom (`Ctrl+=` / `Ctrl+-` / `Ctrl+0`).
 
 ## Phase 6 — Signature Features
 

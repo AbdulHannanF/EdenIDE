@@ -159,8 +159,14 @@ impl TermGrid {
     }
 
     /// Returns a slice of cells for `row` (row-major, 0-indexed).
+    ///
+    /// Returns an empty slice if `row >= self.rows` so callers never panic on a
+    /// stale row index.
     #[must_use]
     pub fn row(&self, row: usize) -> &[TermCell] {
+        if row >= self.rows || self.cols == 0 {
+            return &[];
+        }
         let start = row * self.cols;
         &self.cells[start..start + self.cols]
     }
@@ -190,6 +196,9 @@ impl TermGrid {
     }
 
     fn advance_row(&mut self) {
+        if self.rows == 0 {
+            return;
+        }
         self.cursor_row += 1;
         if self.cursor_row >= self.rows {
             self.scroll_up(1);

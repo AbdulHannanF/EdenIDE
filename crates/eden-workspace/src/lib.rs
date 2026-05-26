@@ -33,7 +33,7 @@ impl Project {
     /// All non-ignored files under the root, as paths relative to it.
     ///
     /// Honors `.gitignore`, `.ignore`, and global git excludes, and skips hidden
-    /// files. Capped at [`MAX_FILES`].
+    /// files. Capped at 50 000 entries to keep Cmd-P responsive in huge trees.
     #[must_use]
     pub fn files(&self) -> Vec<PathBuf> {
         let mut files = Vec::new();
@@ -98,7 +98,7 @@ impl FileTree {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        let entries = read_dir_entries(&root, &root, 0);
+        let entries = read_dir_entries(&root, 0);
         Self { root, entries }
     }
 
@@ -134,7 +134,7 @@ impl FileTree {
             let entry = &self.entries[index];
             (entry.path.clone(), entry.depth)
         };
-        let children = read_dir_entries(&path, &self.root, depth + 1);
+        let children = read_dir_entries(&path, depth + 1);
         self.entries[index].expanded = true;
         self.entries.splice(index + 1..index + 1, children);
     }
@@ -152,7 +152,7 @@ impl FileTree {
 
 /// Reads the immediate children of `dir` (gitignore-aware), directories first,
 /// then alphabetically.
-fn read_dir_entries(dir: &Path, root: &Path, depth: usize) -> Vec<TreeEntry> {
+fn read_dir_entries(dir: &Path, depth: usize) -> Vec<TreeEntry> {
     let mut entries: Vec<TreeEntry> = WalkBuilder::new(dir)
         .max_depth(Some(1))
         .hidden(true)
@@ -172,7 +172,6 @@ fn read_dir_entries(dir: &Path, root: &Path, depth: usize) -> Vec<TreeEntry> {
             TreeEntry { path, name, is_dir, expanded: false, depth }
         })
         .collect();
-    let _ = root;
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,

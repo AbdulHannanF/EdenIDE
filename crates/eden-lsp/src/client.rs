@@ -186,7 +186,7 @@ impl LspClient {
     /// [`hover`][Self::hover] on a subsequent frame.
     pub fn request_hover(&self, uri: &str, pos: Position) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        *self.hover_req_id.lock().unwrap() = Some(id);
+        *self.hover_req_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
         self.enqueue_or_send(rpc::frame_request(
             id,
             "textDocument/hover",
@@ -199,21 +199,21 @@ impl LspClient {
 
     /// The most recently received hover card, if any.
     pub fn hover(&self) -> Option<HoverCard> {
-        self.hover.lock().unwrap().clone()
+        self.hover.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Discards the cached hover card (call when the cursor moves).
     pub fn clear_hover(&self) {
-        *self.hover.lock().unwrap() = None;
+        *self.hover.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Fires a `textDocument/completion` request. Results are available via
     /// [`completions`][Self::completions] on a subsequent frame.
     pub fn request_completions(&self, uri: &str, pos: Position) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        *self.completion_req_id.lock().unwrap() = Some(id);
+        *self.completion_req_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
         // Clear stale results immediately so the caller can detect "fresh".
-        self.completions.lock().unwrap().clear();
+        self.completions.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.enqueue_or_send(rpc::frame_request(
             id,
             "textDocument/completion",
@@ -228,15 +228,15 @@ impl LspClient {
     /// The most recently received completion items (may be empty while a
     /// request is in flight).
     pub fn completions(&self) -> Vec<CompletionItem> {
-        self.completions.lock().unwrap().clone()
+        self.completions.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Fires a `textDocument/definition` request. The result is available via
     /// [`definition_result`][Self::definition_result] on a subsequent frame.
     pub fn request_definition(&self, uri: &str, pos: Position) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        *self.definition_req_id.lock().unwrap() = Some(id);
-        self.definition.lock().unwrap().take();
+        *self.definition_req_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        self.definition.lock().unwrap_or_else(|e| e.into_inner()).take();
         self.enqueue_or_send(rpc::frame_request(
             id,
             "textDocument/definition",
@@ -250,12 +250,12 @@ impl LspClient {
 
     /// The most recently received definition result, if any.
     pub fn definition_result(&self) -> Option<DefinitionResult> {
-        self.definition.lock().unwrap().clone()
+        self.definition.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Discards the cached definition result.
     pub fn clear_definition(&self) {
-        self.definition.lock().unwrap().take();
+        self.definition.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     // ── internals ─────────────────────────────────────────────────────────
@@ -265,7 +265,7 @@ impl LspClient {
         if self.initialized.load(Ordering::Acquire) {
             self.outbox.send(msg).ok();
         } else {
-            self.pending_queue.lock().unwrap().push(msg);
+            self.pending_queue.lock().unwrap_or_else(|e| e.into_inner()).push(msg);
         }
     }
 }
@@ -350,19 +350,19 @@ fn handle_message(
             .send(rpc::frame_notification("initialized", json!({})))
             .ok();
         initialized.store(true, Ordering::Release);
-        let queued: Vec<String> = pending_queue.lock().unwrap().drain(..).collect();
+        let queued: Vec<String> = pending_queue.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect();
         for queued_msg in queued {
             outbox.send(queued_msg).ok();
         }
         tracing::info!("LSP server initialised");
     } else if let Some(id) = msg.id {
         let result = msg.result.unwrap_or(Value::Null);
-        if hover_req_id.lock().unwrap().is_some_and(|h| h == id) {
-            *hover.lock().unwrap() = parse_hover(&result);
-        } else if completion_req_id.lock().unwrap().is_some_and(|c| c == id) {
-            *completions.lock().unwrap() = parse_completions(&result);
-        } else if definition_req_id.lock().unwrap().is_some_and(|d| d == id) {
-            *definition.lock().unwrap() = parse_definition(&result);
+        if hover_req_id.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|h| h == id) {
+            *hover.lock().unwrap_or_else(|e| e.into_inner()) = parse_hover(&result);
+        } else if completion_req_id.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|c| c == id) {
+            *completions.lock().unwrap_or_else(|e| e.into_inner()) = parse_completions(&result);
+        } else if definition_req_id.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|d| d == id) {
+            *definition.lock().unwrap_or_else(|e| e.into_inner()) = parse_definition(&result);
         }
     } else if let Some(ref method) = msg.method {
         handle_notification(method, msg.params, diagnostics);
@@ -431,8 +431,8 @@ fn parse_hover(v: &Value) -> Option<HoverCard> {
 }
 
 fn parse_completions(v: &Value) -> Vec<CompletionItem> {
-    let items = if v.is_array() {
-        v.as_array().expect("checked above")
+    let items = if let Some(arr) = v.as_array() {
+        arr
     } else if let Some(arr) = v["items"].as_array() {
         arr
     } else {

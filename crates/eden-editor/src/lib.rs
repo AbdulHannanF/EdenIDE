@@ -573,25 +573,54 @@ impl Editor {
     /// Replaces every range in `ranges` with `replacement` as a single undo
     /// step (used by find-and-replace "Replace All"). Ranges are applied
     /// back-to-front so earlier indices stay valid.
+    ///
+    /// Overlapping or out-of-order ranges are handled safely: overlapping
+    /// ranges are merged into a single encompassing range before any edits
+    /// are made, so no region is touched twice.
     pub fn replace_ranges(&mut self, ranges: &[(usize, usize)], replacement: &str) {
         if ranges.is_empty() {
             return;
         }
         self.history.break_run();
         self.history.record(self.buffer.rope(), &self.selections, EditKind::Other);
-        let mut sorted: Vec<(usize, usize)> = ranges.to_vec();
-        sorted.sort_by_key(|r| std::cmp::Reverse(r.0));
-        let mut last_start = self.len();
+
+        // Clamp every range to the current buffer length and discard empties
+        // where start > end (malformed input).
+        let buf_len = self.buffer.len_chars();
+        let mut sorted: Vec<(usize, usize)> = ranges
+            .iter()
+            .map(|&(s, e)| (s.min(buf_len), e.min(buf_len)))
+            .filter(|(s, e)| s <= e)
+            .collect();
+
+        // Sort by ascending start (ties: shorter range first so the merge
+        // below naturally extends to the wider end).
+        sorted.sort_by_key(|&(s, e)| (s, e));
+
+        // Merge only *overlapping* ranges so no position is edited twice.
+        // Ranges that merely touch (one's end == the next's start) are disjoint
+        // and must stay separate, so e.g. replacing "aa" in "aaaa" yields two
+        // replacements, not one.
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
         for (s, e) in sorted {
-            let (s, e) = (s.min(self.len()), e.min(self.len()));
-            if s > e {
+            if let Some(last) = merged.last_mut()
+                && s < last.1
+            {
+                // Strictly overlapping: extend the current merged range.
+                last.1 = last.1.max(e);
                 continue;
             }
+            merged.push((s, e));
+        }
+
+        // Apply back-to-front so earlier char indices remain valid.
+        let mut last_start = 0usize;
+        for (s, e) in merged.iter().copied().rev() {
             self.buffer.remove(s..e);
             self.buffer.insert(s, replacement);
             last_start = s;
         }
-        let caret = (last_start + replacement.chars().count()).min(self.len());
+        let caret = (last_start + replacement.chars().count()).min(self.buffer.len_chars());
         self.selections = vec![Selection::caret(caret)];
         self.normalize();
     }
@@ -925,5 +954,153 @@ mod tests {
         assert!(e.buffer().to_string().ends_with("// end"));
         assert!(e.undo());
         assert!(e.buffer().to_string().ends_with("}\n"));
+    }
+
+    // --- replace_ranges edge cases -------------------------------------------
+
+    /// Overlapping ranges must not corrupt the buffer.  Before the fix,
+    /// processing `(0,5)` after `(3,8)` would remove chars from the already-
+    /// modified region, producing garbage.
+    #[test]
+    fn replace_ranges_overlapping_skips_inner() {
+        let mut e = Editor::from_text("hello world");
+        // (0,11) fully contains (3,8): the wider (overlapping) range should win
+        // and the inner one be skipped.
+        e.replace_ranges(&[(0, 11), (3, 8)], "X");
+        assert_eq!(text(&e), "X");
+    }
+
+    /// Two ranges with the same start: only the first one encountered after
+    /// sorting (the longer one, i.e. the wider range) should be applied.
+    #[test]
+    fn replace_ranges_same_start_wider_wins() {
+        let mut e = Editor::from_text("abcdef");
+        // (0,6) and (0,3) share start 0; (0,6) is wider and must win.
+        e.replace_ranges(&[(0, 3), (0, 6)], "Z");
+        assert_eq!(text(&e), "Z");
+    }
+
+    /// Non-overlapping, out-of-order ranges must still be applied correctly.
+    #[test]
+    fn replace_ranges_out_of_order() {
+        let mut e = Editor::from_text("aXbYc");
+        // Ranges supplied in forward order; apply must work regardless.
+        e.replace_ranges(&[(3, 4), (1, 2)], "-");
+        assert_eq!(text(&e), "a-b-c");
+    }
+
+    /// Adjacent (touching) ranges are disjoint and must each be replaced — this
+    /// is the "Replace All of 'aa' in 'aaaa'" case, which must yield "XX".
+    #[test]
+    fn replace_ranges_adjacent_not_merged() {
+        let mut e = Editor::from_text("aaaa");
+        e.replace_ranges(&[(0, 2), (2, 4)], "X");
+        assert_eq!(text(&e), "XX");
+    }
+
+    /// Replacing with an empty string (deletion) must not panic and must
+    /// produce the correct result.
+    #[test]
+    fn replace_ranges_empty_replacement() {
+        // "aXbYc": delete the two single-char regions at indices 1 and 3.
+        let mut e = Editor::from_text("aXbYc");
+        e.replace_ranges(&[(1, 2), (3, 4)], "");
+        assert_eq!(text(&e), "abc");
+    }
+
+    /// Ranges that reach exactly EOF must not panic.
+    #[test]
+    fn replace_ranges_at_eof() {
+        let mut e = Editor::from_text("abc");
+        e.replace_ranges(&[(1, 3)], "X");
+        assert_eq!(text(&e), "aX");
+    }
+
+    // --- move_lines edge cases -----------------------------------------------
+
+    /// Moving the only line down (no trailing newline, one-line file) is a
+    /// no-op and must not panic.
+    #[test]
+    fn move_lines_single_line_noop() {
+        let mut e = Editor::from_text("only");
+        e.set_caret(0);
+        e.move_lines(true); // can't go down
+        assert_eq!(text(&e), "only");
+        e.move_lines(false); // can't go up
+        assert_eq!(text(&e), "only");
+    }
+
+    /// Moving the last line down is a no-op (no trailing newline case).
+    #[test]
+    fn move_lines_last_line_no_trailing_nl() {
+        let mut e = Editor::from_text("a\nb");
+        // Place caret on line 1 "b" (char index 2).
+        e.set_caret(2);
+        e.move_lines(true); // already at bottom
+        assert_eq!(text(&e), "a\nb");
+    }
+
+    /// Selecting across the final line (no trailing newline) and moving down
+    /// must not panic.
+    #[test]
+    fn move_lines_selection_spans_final_line_no_nl() {
+        let mut e = Editor::from_text("first\nsecond\nthird");
+        // Select lines 1..=2 (both "second" and "third").
+        e.selections = vec![Selection::new(6, 18)];
+        e.move_lines(true); // already at bottom of file — no-op
+        assert_eq!(text(&e), "first\nsecond\nthird");
+    }
+
+    // --- toggle_line_comment edge cases --------------------------------------
+
+    /// Toggle on an empty buffer must not panic.
+    #[test]
+    fn toggle_comment_empty_buffer() {
+        let mut e = Editor::new();
+        e.toggle_line_comment("// "); // should be a no-op
+        assert_eq!(text(&e), "");
+    }
+
+    // --- select_word / select_next_occurrence edge cases --------------------
+
+    /// `select_word` returns false when the caret is on a non-word character.
+    #[test]
+    fn select_word_on_non_word_char() {
+        let mut e = Editor::from_text("( )");
+        e.set_caret(1); // on space
+        assert!(!e.select_word());
+        assert!(e.primary().is_empty());
+    }
+
+    /// `select_next_occurrence` returns false when there is no further
+    /// occurrence of the selected text.
+    #[test]
+    fn select_next_occurrence_returns_false_when_exhausted() {
+        let mut e = Editor::from_text("unique");
+        e.select_all();
+        // Only one occurrence of "unique"; a second call should return false.
+        let first = e.select_next_occurrence();
+        assert!(!first, "no additional occurrence should exist");
+    }
+
+    // --- indent / dedent edge cases ------------------------------------------
+
+    /// `indent_lines` on an empty buffer must not panic.
+    #[test]
+    fn indent_lines_empty_buffer() {
+        let mut e = Editor::new();
+        e.indent_lines(4); // should be a no-op / safe
+        assert_eq!(text(&e), "    ");
+    }
+
+    /// `dedent_lines` when there are fewer leading spaces than `width` must
+    /// only remove what is there (already covered by `saturating_sub` but
+    /// tested explicitly).
+    #[test]
+    fn dedent_lines_partial_indent() {
+        let mut e = Editor::from_text(" x\n");
+        e.set_caret(0);
+        e.dedent_lines(4); // only 1 space present
+        assert_eq!(text(&e), "x\n");
     }
 }
