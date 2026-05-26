@@ -593,6 +593,7 @@ dependencies = [
  "eden-terminal",
  "eden-theme",
  "taffy",
+ "tracing",
  "vello",
 ]
 
