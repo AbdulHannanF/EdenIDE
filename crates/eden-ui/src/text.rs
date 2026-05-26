@@ -218,6 +218,23 @@ pub struct FindBarView<'a> {
     pub whole_word: bool,
 }
 
+/// A single tab label for [`TextSystem::paint_tabs`].
+pub struct TabLabel<'a> {
+    /// Display name (usually the file's basename, or "untitled").
+    pub name: &'a str,
+    /// Whether the document has unsaved edits (drives the leading dot).
+    pub modified: bool,
+}
+
+/// Clickable hit-rects for one tab, returned by [`TextSystem::paint_tabs`].
+#[derive(Clone, Copy)]
+pub struct TabHit {
+    /// The whole tab body (click to activate).
+    pub body: Rect,
+    /// The close (×) button.
+    pub close: Rect,
+}
+
 /// Clickable hit-rects returned by [`TextSystem::paint_find_bar`].
 #[derive(Clone, Copy)]
 pub struct FindBarHits {
@@ -822,32 +839,73 @@ impl TextSystem {
 
     // ── tab bar ───────────────────────────────────────────────────────────
 
-    /// Paints the active-tab label (filename text + accent underline) over the
-    /// tab strip `area`. Does nothing if `label` is `None` (no file open).
+    /// Paints the open-document tabs over the tab strip `area`, returning a
+    /// clickable hit-rect (body + close button) for each tab.
     ///
     /// Called from the render loop *after* `Chrome::paint` so the tab strip
     /// background is already filled; this layer adds the real filename text.
-    pub fn paint_tab_bar(
+    pub fn paint_tabs(
         &mut self,
         scene: &mut Scene,
         area: Rect,
-        label: Option<&str>,
+        tabs: &[TabLabel<'_>],
+        active: usize,
         palette: &Palette,
         scale: f64,
-    ) {
-        let Some(label) = label else { return };
+    ) -> Vec<TabHit> {
         self.ensure_metrics(scale);
-        let tab_w = (200.0 * scale).max(120.0 * scale).min(area.width() * 0.5);
-        let tab = Rect::new(area.x0, area.y0, area.x0 + tab_w, area.y1);
-        // Active tab background.
-        fill_rect(scene, tab, palette.tab_active);
-        // 2 px accent underline at the bottom edge.
-        let uh = 2.0 * scale;
-        fill_rect(scene, Rect::new(tab.x0, tab.y1 - uh, tab.x1, tab.y1), palette.accent);
-        // Filename text with left padding, vertically centred.
+        let mut hits = Vec::with_capacity(tabs.len());
+        if tabs.is_empty() {
+            return hits;
+        }
+        let n = tabs.len() as f64;
+        let tab_w = (area.width() / n).clamp(72.0 * scale, 220.0 * scale);
+        let close_sz = 14.0 * scale;
         let pad = 12.0 * scale;
         let baseline = area.y0 + (area.height() + self.font_size_px) * 0.5;
-        self.draw_text(scene, label, tab.x0 + pad, baseline, with_alpha(palette.text, 0xE0));
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &area);
+        for (i, t) in tabs.iter().enumerate() {
+            let x0 = area.x0 + i as f64 * tab_w;
+            let x1 = (x0 + tab_w).min(area.x1);
+            let body = Rect::new(x0, area.y0, x1, area.y1);
+            let is_active = i == active;
+            fill_rect(scene, body, if is_active { palette.tab_active } else { palette.surface });
+            // Right separator.
+            fill_rect(
+                scene,
+                Rect::new(x1 - scale.max(1.0), area.y0 + 6.0 * scale, x1, area.y1 - 6.0 * scale),
+                palette.divider,
+            );
+            if is_active {
+                let uh = 2.0 * scale;
+                fill_rect(scene, Rect::new(body.x0, body.y1 - uh, body.x1, body.y1), palette.accent);
+            }
+            // Label (with a leading dot when modified), middle-truncated to fit.
+            let prefix = if t.modified { "\u{2022} " } else { "" };
+            let avail = ((tab_w - pad - close_sz - 10.0 * scale) / self.advance).floor().max(1.0) as usize;
+            let label = format!("{prefix}{}", t.name);
+            let shown = ellipsize(&label, avail);
+            let color = if is_active {
+                with_alpha(palette.text, 0xE6)
+            } else {
+                with_alpha(palette.text_muted, 0xCC)
+            };
+            self.draw_text(scene, &shown, body.x0 + pad, baseline, color);
+            // Close button.
+            let cx = body.x1 - close_sz - 6.0 * scale;
+            let cy = area.y0 + (area.height() - close_sz) * 0.5;
+            let close = Rect::new(cx, cy, cx + close_sz, cy + close_sz);
+            self.draw_text(
+                scene,
+                "\u{00D7}",
+                close.x0 + 1.0 * scale,
+                baseline,
+                with_alpha(palette.text_muted, if is_active { 0xD0 } else { 0x80 }),
+            );
+            hits.push(TabHit { body, close });
+        }
+        scene.pop_layer();
+        hits
     }
 
     // ── command palette ───────────────────────────────────────────────────
@@ -1709,6 +1767,19 @@ impl TextSystem {
 
 fn with_alpha(color: Rgba8, alpha: u8) -> Rgba8 {
     Rgba8::rgba(color.r, color.g, color.b, alpha)
+}
+
+/// Truncates `s` to at most `max` characters, appending an ellipsis when cut.
+fn ellipsize(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_owned();
+    }
+    if max <= 1 {
+        return "…".to_owned();
+    }
+    let keep: String = s.chars().take(max - 1).collect();
+    format!("{keep}…")
 }
 
 /// Physical `(font_size, line_height)` for a logical font size and display scale.

@@ -13,7 +13,7 @@
 //!   Ctrl+Shift+H       — toggle time scrubber
 //!   F12                — go to definition (now navigates)
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,7 +28,7 @@ use eden_ui::{
     Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
     EditorFrame, FindBarHits, FindBarView, GutterMark, Highlighter, Highlights, MinimapView,
     PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle, SettingsView,
-    StatusBarView, TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
+    StatusBarView, TabHit, TabLabel, TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -389,6 +389,45 @@ struct GhostCaret {
     fade: Spring,
 }
 
+// ── open document tabs ───────────────────────────────────────────────────────
+
+/// A single open document. The *active* tab's live state lives directly on
+/// `App` (editor, highlights, scroll, …); this struct holds the swapped-out
+/// state of every other tab. Switching tabs moves state between the two with
+/// `std::mem::replace`, so no `Clone` of the editor/highlighter is needed.
+struct OpenTab {
+    path: Option<PathBuf>,
+    editor: Editor,
+    highlights: Highlights,
+    highlighter: Option<Highlighter>,
+    modified: bool,
+    doc_version: i32,
+    scroll_target: f64,
+    h_scroll: f64,
+}
+
+impl OpenTab {
+    /// A placeholder tab for `path` with an empty editor (its editor is
+    /// overwritten the first time the live document is stored back into it).
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            editor: Editor::from_text(""),
+            highlights: Highlights::default(),
+            highlighter: None,
+            modified: false,
+            doc_version: 1,
+            scroll_target: 0.0,
+            h_scroll: 0.0,
+        }
+    }
+}
+
+/// The display name for an optional file path (basename, or "untitled").
+fn tab_name(path: Option<&Path>) -> &str {
+    path.and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("untitled")
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 struct App {
@@ -463,6 +502,12 @@ struct App {
 
     /// Transient status-bar message and the time it was set.
     toast: Option<(String, Instant)>,
+
+    // Open document tabs (B1). The active tab's live state is on `editor`,
+    // `highlights`, etc.; `tabs` holds the others' swapped-out state.
+    tabs: Vec<OpenTab>,
+    active_tab: usize,
+    tab_hits: Vec<TabHit>,
 
     // Find / replace (Ctrl+F / Ctrl+H) and go-to-line (Ctrl+G).
     find_open: bool,
@@ -552,6 +597,9 @@ impl App {
             ghost_caret: None,
             go_to_def_pending: false,
             toast: None,
+            tabs: vec![OpenTab::new(None)],
+            active_tab: 0,
+            tab_hits: Vec::new(),
             find_open: false,
             find: FindState::default(),
             find_hits: None,
@@ -714,6 +762,10 @@ impl App {
         match named {
             NamedKey::Enter => self.edit(true, |e| e.insert("\n")),
             NamedKey::Tab => {
+                if ctrl {
+                    self.cycle_tab(!shift);
+                    return true;
+                }
                 if self.completion_open {
                     self.commit_completion();
                     return true;
@@ -794,11 +846,19 @@ impl App {
                 }
             }
             NamedKey::PageUp => {
-                self.scroll_by_page(-1.0);
+                if ctrl {
+                    self.cycle_tab(false);
+                } else {
+                    self.scroll_by_page(-1.0);
+                }
                 true
             }
             NamedKey::PageDown => {
-                self.scroll_by_page(1.0);
+                if ctrl {
+                    self.cycle_tab(true);
+                } else {
+                    self.scroll_by_page(1.0);
+                }
                 true
             }
             _ => false,
@@ -1126,6 +1186,10 @@ impl App {
                 self.new_file();
                 true
             }
+            ("w" | "W", false) => {
+                self.close_tab(self.active_tab);
+                true
+            }
             ("o" | "O", false) => {
                 self.open_file_dialog();
                 true
@@ -1285,17 +1349,127 @@ impl App {
     }
 
     fn new_file(&mut self) {
-        self.editor = Editor::from_text("");
-        self.highlighter = None;
+        self.store_active_into_tab();
+        self.tabs.push(OpenTab::new(None));
+        self.active_tab = self.tabs.len() - 1;
+        self.reset_live_doc(Editor::from_text(""), None, None);
+    }
+
+    // ── tabs (B1) ───────────────────────────────────────────────────────────
+
+    /// Saves the live document's state back into its tab slot.
+    fn store_active_into_tab(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active_tab) else { return };
+        tab.editor = std::mem::replace(&mut self.editor, Editor::from_text(""));
+        tab.highlights = std::mem::take(&mut self.highlights);
+        tab.highlighter = self.highlighter.take();
+        tab.path = self.current_path.clone();
+        tab.modified = self.modified;
+        tab.doc_version = self.doc_version;
+        tab.scroll_target = self.scroll.target();
+        tab.h_scroll = self.h_scroll;
+    }
+
+    /// Loads tab `idx` into the live document fields (after its previous live
+    /// state has been stored). Re-highlights and refreshes diagnostics.
+    fn load_tab(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        self.editor = std::mem::replace(&mut tab.editor, Editor::from_text(""));
+        self.highlights = std::mem::take(&mut tab.highlights);
+        self.highlighter = tab.highlighter.take();
+        self.current_path = tab.path.clone();
+        self.modified = tab.modified;
+        self.doc_version = tab.doc_version;
+        let target = tab.scroll_target;
+        self.h_scroll = tab.h_scroll;
+        self.scroll.jump_to(target);
+        self.doc_dirty = true;
+        self.gutter_marks.clear();
+        self.diff_marks.clear();
+        self.hover_card = None;
+        self.hover_requested_for = None;
+        self.dismiss_completion();
+        self.find_open = false;
+        self.ensure_visible = true;
+        if let Some(path) = self.current_path.clone() {
+            let text = self.editor.buffer().to_string();
+            self.lsp.open_document(&path, &text);
+        }
+        self.refresh_diff_marks();
+    }
+
+    /// Switches to tab `idx`, saving the current document first.
+    fn activate_tab(&mut self, idx: usize) {
+        if idx == self.active_tab || idx >= self.tabs.len() {
+            return;
+        }
+        self.store_active_into_tab();
+        self.active_tab = idx;
+        self.load_tab(idx);
+    }
+
+    /// Closes tab `idx`. Closing the last remaining tab resets it to a blank
+    /// untitled document rather than leaving the editor empty.
+    fn close_tab(&mut self, idx: usize) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            self.tabs[0] = OpenTab::new(None);
+            self.active_tab = 0;
+            self.reset_live_doc(Editor::from_text(""), None, None);
+            return;
+        }
+        if idx == self.active_tab {
+            let n = self.tabs.len();
+            let neighbor = if idx + 1 < n { idx + 1 } else { idx - 1 };
+            self.tabs.remove(idx);
+            let new_active = if neighbor > idx { neighbor - 1 } else { neighbor };
+            self.active_tab = new_active;
+            self.load_tab(new_active);
+        } else {
+            self.tabs.remove(idx);
+            if idx < self.active_tab {
+                self.active_tab -= 1;
+            }
+        }
+    }
+
+    /// Cycles to the next (`forward`) or previous open tab, wrapping around.
+    fn cycle_tab(&mut self, forward: bool) {
+        let n = self.tabs.len();
+        if n <= 1 {
+            return;
+        }
+        let next = if forward {
+            (self.active_tab + 1) % n
+        } else {
+            (self.active_tab + n - 1) % n
+        };
+        self.activate_tab(next);
+    }
+
+    /// Resets the live document fields to a freshly loaded `editor`.
+    fn reset_live_doc(
+        &mut self,
+        editor: Editor,
+        path: Option<PathBuf>,
+        highlighter: Option<Highlighter>,
+    ) {
+        self.editor = editor;
+        self.highlighter = highlighter;
         self.highlights = Highlights::default();
-        self.current_path = None;
+        self.current_path = path;
         self.modified = false;
-        self.doc_dirty = false;
+        self.doc_dirty = true;
         self.doc_version = 1;
         self.scroll.jump_to(0.0);
         self.h_scroll = 0.0;
         self.gutter_marks.clear();
         self.diff_marks.clear();
+        self.hover_card = None;
+        self.hover_requested_for = None;
+        self.dismiss_completion();
         self.ensure_visible = true;
     }
 
@@ -1682,11 +1856,36 @@ impl App {
 
     // ── file opening ──────────────────────────────────────────────────────
 
+    /// Returns the tab index already showing `path`, if any.
+    fn open_tab_index(&self, path: &Path) -> Option<usize> {
+        if self.current_path.as_deref() == Some(path) {
+            return Some(self.active_tab);
+        }
+        self.tabs
+            .iter()
+            .enumerate()
+            .find(|(i, t)| *i != self.active_tab && t.path.as_deref() == Some(path))
+            .map(|(i, _)| i)
+    }
+
     fn open_path(&mut self, path: &std::path::Path) {
         // Guard: never open build artifacts from target/.
         if is_in_target_dir(path, self.project.root()) {
             tracing::debug!(file = %path.display(), "skipped target/ artifact");
             return;
+        }
+
+        // Already open → just switch to that tab.
+        if let Some(i) = self.open_tab_index(path) {
+            self.activate_tab(i);
+            return;
+        }
+
+        // Reuse a blank untitled tab; otherwise open a fresh tab.
+        if self.current_path.is_some() || self.modified {
+            self.store_active_into_tab();
+            self.tabs.push(OpenTab::new(Some(path.to_path_buf())));
+            self.active_tab = self.tabs.len() - 1;
         }
 
         // Guard: binary files show a placeholder instead of raw bytes.
@@ -1903,6 +2102,25 @@ impl App {
 
     fn on_click(&mut self) -> bool {
         let Some(point) = self.cursor else { return false };
+
+        // Tab strip: activate (body) or close (×) a tab.
+        let tab_action = self.tab_hits.iter().enumerate().find_map(|(i, h)| {
+            if h.close.contains(point) {
+                Some((i, true))
+            } else if h.body.contains(point) {
+                Some((i, false))
+            } else {
+                None
+            }
+        });
+        if let Some((i, close)) = tab_action {
+            if close {
+                self.close_tab(i);
+            } else {
+                self.activate_tab(i);
+            }
+            return true;
+        }
 
         // Phase 6: Time scrubber click — jump to that undo position.
         if let Some(rect) = self.scrubber_rect
@@ -2187,17 +2405,31 @@ impl App {
             chrome.paint(&mut self.scene);
         }
 
-        // Tab bar: overlay the real filename over the tab strip background that
-        // Chrome just filled. Only shown when a file is open (current_path set).
+        // Tab bar: overlay the open-document tabs over the tab strip background
+        // that Chrome just filled.
+        let active_idx = self.active_tab;
         let modified = self.modified;
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
-            let label = self.current_path.as_ref()
-                .and_then(|p| p.file_name())
-                .and_then(|n| n.to_str())
-                .map(|s| if modified { format!("\u{2022} {s}") } else { s.to_owned() });
+            let labels_owned: Vec<(String, bool)> = self
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    if i == active_idx {
+                        (tab_name(self.current_path.as_deref()).to_owned(), modified)
+                    } else {
+                        (tab_name(t.path.as_deref()).to_owned(), t.modified)
+                    }
+                })
+                .collect();
+            let labels: Vec<TabLabel<'_>> = labels_owned
+                .iter()
+                .map(|(n, m)| TabLabel { name: n, modified: *m })
+                .collect();
             let tab_rect = chrome.tab_strip_rect();
             let palette = chrome.palette();
-            text.paint_tab_bar(&mut self.scene, tab_rect, label.as_deref(), &palette, self.scale);
+            self.tab_hits =
+                text.paint_tabs(&mut self.scene, tab_rect, &labels, active_idx, &palette, self.scale);
         }
 
         // Status bar: real branch, language, and cursor position text.
