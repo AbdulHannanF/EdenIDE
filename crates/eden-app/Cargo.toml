@@ -31,3 +31,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 vello = "0.9.0"
 winit = "0.30.13"
+# design: system clipboard (Ctrl+C/X/V) — single small dep, the standard crate.
+arboard = "3"
+# design: native open/save dialogs (Ctrl+O, Ctrl+Shift+S).
+rfd = "0.15"

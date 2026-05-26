@@ -125,6 +125,20 @@ fn language_for_path(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
+/// The line-comment token for a file's language (Ctrl+/). Defaults to `"// "`.
+fn comment_token_for_path(path: Option<&std::path::Path>) -> &'static str {
+    let ext = path
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "py" | "sh" | "toml" | "yaml" | "yml" | "cfg" | "ini" | "gitignore" | "env" => "# ",
+        "sql" | "lua" => "-- ",
+        _ => "// ",
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
@@ -370,6 +384,10 @@ struct App {
     highlighter: Option<Highlighter>,
     highlights: Highlights,
     doc_dirty: bool,
+    /// Unsaved edits since the last save/open — drives the tab `•` indicator.
+    modified: bool,
+    /// System clipboard handle (lazily fails closed if unavailable).
+    clipboard: Option<arboard::Clipboard>,
 
     project: Project,
     files: Vec<String>,
@@ -424,6 +442,9 @@ struct App {
     ghost_caret: Option<GhostCaret>,
     go_to_def_pending: bool,
 
+    /// Transient status-bar message and the time it was set.
+    toast: Option<(String, Instant)>,
+
     cursor: Option<Point>,
     scroll: Spring,
     // design: horizontal scroll offset in physical pixels. No spring — pixel
@@ -472,6 +493,8 @@ impl App {
             highlighter: None,
             highlights: Highlights::default(),
             doc_dirty: true,
+            modified: false,
+            clipboard: arboard::Clipboard::new().ok(),
             project,
             files,
             fuzzy: FuzzyMatcher::new(),
@@ -502,6 +525,7 @@ impl App {
             scrubber_rect: None,
             ghost_caret: None,
             go_to_def_pending: false,
+            toast: None,
             cursor: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             h_scroll: 0.0,
@@ -619,16 +643,22 @@ impl App {
         }
         let ctrl = self.mods.control_key() || self.mods.super_key();
         let shift = self.mods.shift_key();
+        let alt = self.mods.alt_key();
         match &event.logical_key {
             Key::Named(NamedKey::F12) => {
                 self.go_to_definition();
                 true
             }
-            Key::Named(named) => self.on_named_key(*named, shift),
+            Key::Named(NamedKey::F2) => {
+                self.toast("Rename Symbol — not yet implemented");
+                true
+            }
+            Key::Named(named) => self.on_named_key(*named, ctrl, shift, alt),
             Key::Character(s) if ctrl => self.on_command(s, shift),
             Key::Character(s) => {
                 self.editor.insert(s);
                 self.doc_dirty = true;
+                self.modified = true;
                 self.ensure_visible = true;
                 self.dismiss_completion();
                 // Bright spike on each keystroke (§7.6).
@@ -643,7 +673,7 @@ impl App {
         }
     }
 
-    fn on_named_key(&mut self, named: NamedKey, shift: bool) -> bool {
+    fn on_named_key(&mut self, named: NamedKey, ctrl: bool, shift: bool, alt: bool) -> bool {
         match named {
             NamedKey::Enter => self.edit(true, |e| e.insert("\n")),
             NamedKey::Tab => {
@@ -651,18 +681,23 @@ impl App {
                     self.commit_completion();
                     return true;
                 }
-                self.edit(true, |e| e.insert("    "))
+                if shift {
+                    let w = self.settings.tab_width as usize;
+                    return self.edit(true, |e| e.dedent_lines(w));
+                }
+                // Indent the block when there's a selection, else insert spaces.
+                let w = self.settings.tab_width as usize;
+                if self.editor.primary().is_empty() {
+                    self.edit(true, move |e| e.insert(&" ".repeat(w)))
+                } else {
+                    self.edit(true, move |e| e.indent_lines(w))
+                }
             }
             NamedKey::Backspace => self.edit(true, Editor::backspace),
             NamedKey::Delete => self.edit(true, Editor::delete_forward),
             NamedKey::Space => self.edit(true, |e| e.insert(" ")),
             NamedKey::Escape => {
-                if self.completion_open {
-                    self.dismiss_completion();
-                    return true;
-                }
-                if self.search_open {
-                    self.search_open = false;
+                if self.close_top_overlay() {
                     return true;
                 }
                 false
@@ -677,6 +712,13 @@ impl App {
                     }
                     return true;
                 }
+                if alt {
+                    return self.edit(true, |e| e.move_lines(false));
+                }
+                if ctrl {
+                    self.scroll.set_target(self.scroll.target() - self.line_h() * 3.0);
+                    return true;
+                }
                 self.edit(false, |e| e.move_up(shift))
             }
             NamedKey::ArrowDown => {
@@ -687,10 +729,33 @@ impl App {
                     }
                     return true;
                 }
+                if alt {
+                    return self.edit(true, |e| e.move_lines(true));
+                }
+                if ctrl {
+                    self.scroll.set_target(self.scroll.target() + self.line_h() * 3.0);
+                    return true;
+                }
                 self.edit(false, |e| e.move_down(shift))
             }
-            NamedKey::Home => self.edit(false, |e| e.move_line_start(shift)),
-            NamedKey::End => self.edit(false, |e| e.move_line_end(shift)),
+            NamedKey::Home => {
+                if ctrl {
+                    self.edit(false, |e| e.set_selection(if shift { e.primary().anchor } else { 0 }, 0))
+                } else {
+                    self.edit(false, |e| e.move_line_start(shift))
+                }
+            }
+            NamedKey::End => {
+                if ctrl {
+                    let end = self.editor.buffer().len_chars();
+                    self.edit(false, move |e| {
+                        let anchor = if shift { e.primary().anchor } else { end };
+                        e.set_selection(anchor, end);
+                    })
+                } else {
+                    self.edit(false, |e| e.move_line_end(shift))
+                }
+            }
             NamedKey::PageUp => {
                 self.scroll_by_page(-1.0);
                 true
@@ -701,6 +766,42 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// The editor line height in physical pixels, or a sane default.
+    fn line_h(&self) -> f64 {
+        self.text.as_ref().map_or(20.0, TextSystem::line_height)
+    }
+
+    /// A transient status-bar message (auto-clears after a few seconds).
+    fn toast(&mut self, msg: &str) {
+        self.toast = Some((msg.to_owned(), Instant::now()));
+    }
+
+    /// Closes the topmost open overlay (palette, search, completion, etc).
+    /// Returns whether anything was closed.
+    fn close_top_overlay(&mut self) -> bool {
+        if self.completion_open {
+            self.dismiss_completion();
+            return true;
+        }
+        if self.cmd_palette.is_some() {
+            self.cmd_palette = None;
+            return true;
+        }
+        if self.palette.is_some() {
+            self.palette = None;
+            return true;
+        }
+        if self.settings_open {
+            self.settings_open = false;
+            return true;
+        }
+        if self.search_open {
+            self.search_open = false;
+            return true;
+        }
+        false
     }
 
     fn on_command(&mut self, key: &str, shift: bool) -> bool {
@@ -720,10 +821,63 @@ impl App {
             ("z" | "Z", false) => self.edit(true, |e| {
                 e.undo();
             }),
-            ("y" | "Y", false) => self.edit(true, |e| {
+            // Redo: both Ctrl+Y and Ctrl+Shift+Z.
+            ("y" | "Y", false) | ("z" | "Z", true) => self.edit(true, |e| {
                 e.redo();
             }),
             ("a" | "A", false) => self.edit(false, Editor::select_all),
+            ("c" | "C", false) => {
+                self.clipboard_copy();
+                true
+            }
+            ("x" | "X", false) => {
+                self.clipboard_cut();
+                true
+            }
+            ("v" | "V", false) => {
+                self.clipboard_paste();
+                true
+            }
+            ("d" | "D", false) => self.edit(false, |e| {
+                e.select_next_occurrence();
+            }),
+            ("l" | "L", false) => self.edit(false, Editor::select_line),
+            ("/", false) => {
+                let token = comment_token_for_path(self.current_path.as_deref());
+                self.edit(true, |e| e.toggle_line_comment(token))
+            }
+            ("s" | "S", false) => {
+                self.save_current();
+                true
+            }
+            ("s" | "S", true) => {
+                self.save_current_as();
+                true
+            }
+            ("n" | "N", false) => {
+                self.new_file();
+                true
+            }
+            ("o" | "O", false) => {
+                self.open_file_dialog();
+                true
+            }
+            // Font zoom.
+            ("=" | "+", false) => {
+                self.adjust_font_size(1.0);
+                true
+            }
+            ("-" | "_", false) => {
+                self.adjust_font_size(-1.0);
+                true
+            }
+            ("0", false) => {
+                if let Some(text) = &mut self.text {
+                    text.set_font_size(14.0);
+                }
+                self.settings.font_size = 14;
+                true
+            }
             ("p" | "P", false) => {
                 self.open_palette();
                 true
@@ -760,6 +914,120 @@ impl App {
                 true
             }
             _ => false,
+        }
+    }
+
+    // ── clipboard ─────────────────────────────────────────────────────────
+
+    fn clipboard_copy(&mut self) {
+        let text = self.editor.copy_text();
+        if let Some(cb) = &mut self.clipboard
+            && let Err(err) = cb.set_text(text)
+        {
+            tracing::warn!("clipboard copy failed: {err}");
+        }
+    }
+
+    fn clipboard_cut(&mut self) {
+        let text = self.editor.cut();
+        self.doc_dirty = true;
+        self.modified = true;
+        self.ensure_visible = true;
+        if let Some(cb) = &mut self.clipboard
+            && let Err(err) = cb.set_text(text)
+        {
+            tracing::warn!("clipboard cut failed: {err}");
+        }
+    }
+
+    fn clipboard_paste(&mut self) {
+        let Some(cb) = &mut self.clipboard else { return };
+        match cb.get_text() {
+            Ok(text) if !text.is_empty() => {
+                // Normalise CRLF so pasted Windows text doesn't leave stray \r.
+                let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                self.editor.insert(&text);
+                self.doc_dirty = true;
+                self.modified = true;
+                self.ensure_visible = true;
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("clipboard paste failed: {err}"),
+        }
+    }
+
+    // ── font size ─────────────────────────────────────────────────────────
+
+    fn adjust_font_size(&mut self, delta: f64) {
+        if let Some(text) = &mut self.text {
+            let next = (text.font_size_logical() + delta).clamp(9.0, 28.0);
+            text.set_font_size(next);
+            self.settings.font_size = next.round() as u32;
+            self.ensure_visible = true;
+        }
+    }
+
+    // ── save / open ─────────────────────────────────────────────────────────
+
+    fn save_current(&mut self) {
+        let Some(path) = self.current_path.clone() else {
+            self.save_current_as();
+            return;
+        };
+        self.write_to(&path);
+    }
+
+    fn save_current_as(&mut self) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = self.current_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        if let Some(path) = dialog.save_file() {
+            self.write_to(&path);
+            self.current_path = Some(path);
+        }
+    }
+
+    fn write_to(&mut self, path: &std::path::Path) {
+        let contents = self.editor.buffer().to_string();
+        match std::fs::write(path, &contents) {
+            Ok(()) => {
+                self.modified = false;
+                self.refresh_diff_marks();
+                self.toast(&format!("Saved {}", path.display()));
+                tracing::info!(file = %path.display(), "saved");
+            }
+            Err(err) => {
+                self.toast(&format!("Save failed: {err}"));
+                tracing::warn!(file = %path.display(), "save failed: {err}");
+            }
+        }
+    }
+
+    fn new_file(&mut self) {
+        self.editor = Editor::from_text("");
+        self.highlighter = None;
+        self.highlights = Highlights::default();
+        self.current_path = None;
+        self.modified = false;
+        self.doc_dirty = false;
+        self.doc_version = 1;
+        self.scroll.jump_to(0.0);
+        self.h_scroll = 0.0;
+        self.gutter_marks.clear();
+        self.diff_marks.clear();
+        self.ensure_visible = true;
+    }
+
+    fn open_file_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = self.current_path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        } else {
+            dialog = dialog.set_directory(self.project.root());
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open_path(&path);
         }
     }
 
@@ -1148,6 +1416,7 @@ impl App {
             self.highlighter = None;
             self.highlights = Highlights::default();
             self.doc_dirty = false;
+            self.modified = false;
             self.doc_version = 1;
             self.scroll.jump_to(0.0);
             self.h_scroll = 0.0;
@@ -1180,9 +1449,10 @@ impl App {
                 };
                 self.highlights = Highlights::default();
                 self.doc_dirty = true;
+                self.modified = false;
                 self.doc_version = 1;
                 self.scroll.jump_to(0.0);
-            self.h_scroll = 0.0;
+                self.h_scroll = 0.0;
                 self.ensure_visible = true;
                 self.current_path = Some(path.to_path_buf());
                 self.gutter_marks.clear();
@@ -1423,6 +1693,7 @@ impl App {
         action(&mut self.editor);
         if mutates {
             self.doc_dirty = true;
+            self.modified = true;
             // Focus Halo: dim chrome on every mutating key.
             if let Some(chrome) = &mut self.chrome {
                 chrome.enter_typing();
@@ -1600,17 +1871,29 @@ impl App {
 
         // Tab bar: overlay the real filename over the tab strip background that
         // Chrome just filled. Only shown when a file is open (current_path set).
+        let modified = self.modified;
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let label = self.current_path.as_ref()
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str())
-                .map(|s| s.to_owned());
+                .map(|s| if modified { format!("\u{2022} {s}") } else { s.to_owned() });
             let tab_rect = chrome.tab_strip_rect();
             let palette = chrome.palette();
             text.paint_tab_bar(&mut self.scene, tab_rect, label.as_deref(), &palette, self.scale);
         }
 
         // Status bar: real branch, language, and cursor position text.
+        let toast_msg = self
+            .toast
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < Duration::from_secs(4))
+            .map(|(m, _)| m.clone());
+        let diag_counts = self.gutter_marks.iter().fold((0usize, 0usize), |(e, w), (_, m)| {
+            match m {
+                GutterMark::Error => (e + 1, w),
+                GutterMark::Warning => (e, w + 1),
+            }
+        });
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let status_rect = chrome.status_bar_rect();
             let palette = chrome.palette();
@@ -1630,6 +1913,8 @@ impl App {
                     language: lang.as_deref(),
                     line,
                     col,
+                    diagnostics: diag_counts,
+                    message: toast_msg.as_deref(),
                 },
                 &palette,
                 self.scale,

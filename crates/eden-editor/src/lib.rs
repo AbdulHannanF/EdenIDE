@@ -275,6 +275,324 @@ impl Editor {
         self.selections = vec![Selection::new(0, self.len())];
     }
 
+    /// Replaces the selection set with a single selection `anchor..head`
+    /// (used by find navigation and go-to-position jumps).
+    pub fn set_selection(&mut self, anchor: usize, head: usize) {
+        self.history.break_run();
+        let max = self.len();
+        self.selections = vec![Selection::new(anchor.min(max), head.min(max))];
+    }
+
+    // --- clipboard ----------------------------------------------------------
+
+    /// The text a copy should place on the clipboard: the primary selection's
+    /// text if non-empty, otherwise the whole current line including its
+    /// trailing newline (so a paste re-inserts a full line).
+    #[must_use]
+    pub fn copy_text(&self) -> String {
+        let sel = self.primary();
+        if sel.is_empty() {
+            let line = self.buffer.char_to_line(sel.head);
+            let (start, end) = self.line_span_with_break(line);
+            self.buffer.slice_to_string(start..end)
+        } else {
+            self.buffer.slice_to_string(sel.range())
+        }
+    }
+
+    /// Removes the primary selection — or the whole current line if it is empty
+    /// — and returns the removed text for a cut. Records one undo step.
+    pub fn cut(&mut self) -> String {
+        let sel = self.primary();
+        self.history.break_run();
+        let (start, end, text) = if sel.is_empty() {
+            let line = self.buffer.char_to_line(sel.head);
+            let (s, e) = self.line_span_with_break(line);
+            (s, e, self.buffer.slice_to_string(s..e))
+        } else {
+            (sel.start(), sel.end(), self.buffer.slice_to_string(sel.range()))
+        };
+        if start == end {
+            return text;
+        }
+        self.history.record(self.buffer.rope(), &self.selections, EditKind::Other);
+        self.buffer.remove(start..end);
+        self.selections = vec![Selection::caret(start)];
+        self.normalize();
+        text
+    }
+
+    /// The char range of `line` including its trailing line break, clamped to
+    /// the buffer end for the final line.
+    fn line_span_with_break(&self, line: usize) -> (usize, usize) {
+        let start = self.buffer.line_to_char(line);
+        let end = if line + 1 < self.buffer.len_lines() {
+            self.buffer.line_to_char(line + 1)
+        } else {
+            self.buffer.len_chars()
+        };
+        (start, end)
+    }
+
+    // --- line operations ----------------------------------------------------
+
+    /// Inclusive `[first, last]` line span touched by the primary selection.
+    fn primary_line_span(&self) -> (usize, usize) {
+        let sel = self.primary();
+        (self.buffer.char_to_line(sel.start()), self.buffer.char_to_line(sel.end()))
+    }
+
+    /// Selects the full line(s) the primary selection touches, including the
+    /// trailing newline (Ctrl+L).
+    pub fn select_line(&mut self) {
+        self.history.break_run();
+        let (first, last) = self.primary_line_span();
+        let start = self.buffer.line_to_char(first);
+        let (_, end) = self.line_span_with_break(last);
+        self.selections = vec![Selection::new(start, end)];
+    }
+
+    /// Indents every line the primary selection touches by `width` spaces.
+    pub fn indent_lines(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        let was_empty = self.primary().is_empty();
+        let head_col = {
+            let h = self.primary().head;
+            h - self.buffer.line_to_char(self.buffer.char_to_line(h))
+        };
+        let (first, last) = self.primary_line_span();
+        self.history.break_run();
+        self.history.record(self.buffer.rope(), &self.selections, EditKind::Other);
+        let spaces = " ".repeat(width);
+        for line in (first..=last).rev() {
+            let at = self.buffer.line_to_char(line);
+            self.buffer.insert(at, &spaces);
+        }
+        self.reselect_after_line_edit(first, last, was_empty, head_col + width);
+    }
+
+    /// Removes up to `width` leading spaces (or one leading tab) from every line
+    /// the primary selection touches.
+    pub fn dedent_lines(&mut self, width: usize) {
+        if width == 0 {
+            return;
+        }
+        let was_empty = self.primary().is_empty();
+        let head_col = {
+            let h = self.primary().head;
+            h - self.buffer.line_to_char(self.buffer.char_to_line(h))
+        };
+        let (first, last) = self.primary_line_span();
+        self.history.break_run();
+        self.history.record(self.buffer.rope(), &self.selections, EditKind::Other);
+        let mut removed_on_head_line = 0usize;
+        let head_line = self.buffer.char_to_line(self.primary().head);
+        for line in (first..=last).rev() {
+            let at = self.buffer.line_to_char(line);
+            let rope = self.buffer.rope();
+            let len = rope.len_chars();
+            let mut take = 0;
+            while take < width && at + take < len {
+                let c = rope.char(at + take);
+                if c == '\t' {
+                    take += 1;
+                    break;
+                }
+                if c == ' ' {
+                    take += 1;
+                } else {
+                    break;
+                }
+            }
+            if take > 0 {
+                self.buffer.remove(at..at + take);
+                if line == head_line {
+                    removed_on_head_line = take;
+                }
+            }
+        }
+        let new_col = head_col.saturating_sub(removed_on_head_line);
+        self.reselect_after_line_edit(first, last, was_empty, new_col);
+    }
+
+    /// Toggles a line comment (`token`, e.g. `"// "`) on the touched lines. If
+    /// every non-blank line is already commented, uncomments instead.
+    pub fn toggle_line_comment(&mut self, token: &str) {
+        let trimmed = token.trim_end();
+        if trimmed.is_empty() {
+            return;
+        }
+        let (first, last) = self.primary_line_span();
+        let lines: Vec<String> = (first..=last)
+            .map(|l| {
+                let (s, e) = (self.buffer.line_to_char(l), self.buffer.line_end(l));
+                self.buffer.slice_to_string(s..e)
+            })
+            .collect();
+        let all_commented = lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .all(|l| l.trim_start().starts_with(trimmed));
+        self.history.break_run();
+        self.history.record(self.buffer.rope(), &self.selections, EditKind::Other);
+        // Edit bottom-up so earlier line starts stay valid.
+        for (offset, original) in lines.iter().enumerate().rev() {
+            let line = first + offset;
+            if original.trim().is_empty() {
+                continue;
+            }
+            let line_start = self.buffer.line_to_char(line);
+            let indent = original.len() - original.trim_start().len();
+            // `indent` counts ASCII whitespace, so it is also a char offset.
+            if all_commented {
+                let after = &original[indent..];
+                let mut strip = trimmed.len();
+                if after[trimmed.len()..].starts_with(' ') {
+                    strip += 1;
+                }
+                self.buffer.remove(line_start + indent..line_start + indent + strip);
+            } else {
+                self.buffer.insert(line_start + indent, token);
+            }
+        }
+        let start = self.buffer.line_to_char(first);
+        let end = self.buffer.line_end(last);
+        self.selections = vec![Selection::new(start, end)];
+        self.normalize();
+    }
+
+    /// Moves the touched line(s) up or down by one, swapping with the adjacent
+    /// line. Keeps the moved block selected.
+    pub fn move_lines(&mut self, down: bool) {
+        let (first, last) = self.primary_line_span();
+        let text = self.buffer.to_string();
+        let trailing_nl = text.ends_with('\n');
+        let mut lines: Vec<String> = text.split('\n').map(str::to_owned).collect();
+        if trailing_nl {
+            lines.pop();
+        }
+        let n = lines.len();
+        if n == 0 {
+            return;
+        }
+        let last = last.min(n - 1);
+        let first = first.min(last);
+        let (new_first, new_last) = if down {
+            if last + 1 >= n {
+                return;
+            }
+            let moved = lines.remove(last + 1);
+            lines.insert(first, moved);
+            (first + 1, last + 1)
+        } else {
+            if first == 0 {
+                return;
+            }
+            let moved = lines.remove(first - 1);
+            lines.insert(last, moved);
+            (first - 1, last - 1)
+        };
+        let mut rebuilt = lines.join("\n");
+        if trailing_nl {
+            rebuilt.push('\n');
+        }
+        self.history.break_run();
+        self.history.record(self.buffer.rope(), &self.selections, EditKind::Other);
+        self.buffer = Buffer::from_text(&rebuilt);
+        let start = self.buffer.line_to_char(new_first);
+        let end = self.buffer.line_end(new_last);
+        self.selections = vec![Selection::new(start, end)];
+        self.normalize();
+    }
+
+    // --- multi-cursor occurrence selection ----------------------------------
+
+    /// Selects the word under the primary caret. Returns whether a word was
+    /// found.
+    pub fn select_word(&mut self) -> bool {
+        let rope = self.buffer.rope();
+        let len = rope.len_chars();
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let head = self.primary().head.min(len);
+        let mut start = head;
+        while start > 0 && is_word(rope.char(start - 1)) {
+            start -= 1;
+        }
+        let mut end = head;
+        while end < len && is_word(rope.char(end)) {
+            end += 1;
+        }
+        if start == end {
+            return false;
+        }
+        self.history.break_run();
+        self.selections = vec![Selection::new(start, end)];
+        true
+    }
+
+    /// Adds a selection at the next occurrence of the primary selection's text
+    /// (Ctrl+D). If the primary selection is empty, selects the word under the
+    /// caret instead. Returns whether the selection set changed.
+    pub fn select_next_occurrence(&mut self) -> bool {
+        let sel = self.primary();
+        if sel.is_empty() {
+            return self.select_word();
+        }
+        let needle = self.buffer.slice_to_string(sel.range());
+        if needle.is_empty() {
+            return false;
+        }
+        let rope = self.buffer.rope();
+        let from_char = self.selections.iter().map(Selection::end).max().unwrap_or(0);
+        let hay = rope.to_string();
+        let from_byte = rope.char_to_byte(from_char.min(rope.len_chars()));
+        let found = hay[from_byte..]
+            .find(&needle)
+            .map(|b| from_byte + b)
+            .or_else(|| hay.find(&needle));
+        let Some(byte_pos) = found else {
+            return false;
+        };
+        let char_start = rope.byte_to_char(byte_pos);
+        let char_end = char_start + needle.chars().count();
+        if self
+            .selections
+            .iter()
+            .any(|s| s.start() == char_start && s.end() == char_end)
+        {
+            return false;
+        }
+        self.history.break_run();
+        self.selections.push(Selection::new(char_start, char_end));
+        self.normalize();
+        true
+    }
+
+    /// Restores the selection after a per-line edit: covers the whole block for
+    /// a multi-line selection, or places a caret at `head_col` on the (single)
+    /// touched line when the original selection was an empty caret.
+    fn reselect_after_line_edit(
+        &mut self,
+        first: usize,
+        last: usize,
+        was_caret: bool,
+        head_col: usize,
+    ) {
+        if was_caret && first == last {
+            let line_start = self.buffer.line_to_char(first);
+            let line_len = self.buffer.line_len(first);
+            let at = line_start + head_col.min(line_len);
+            self.selections = vec![Selection::caret(at)];
+        } else {
+            let start = self.buffer.line_to_char(first);
+            let end = self.buffer.line_end(last);
+            self.selections = vec![Selection::new(start, end)];
+        }
+        self.normalize();
+    }
+
     fn move_horizontal(&mut self, dir: Horizontal, extend: bool) {
         let len = self.len();
         for sel in &mut self.selections {
@@ -471,6 +789,93 @@ mod tests {
         // current head, so column is 2 here — documented behaviour.
         let (line, _) = e.buffer().line_col(e.primary().head);
         assert_eq!(line, 2);
+    }
+
+    #[test]
+    fn copy_uses_selection_then_whole_line() {
+        let mut e = Editor::from_text("hello\nworld\n");
+        e.selections = vec![Selection::new(0, 5)];
+        assert_eq!(e.copy_text(), "hello");
+        e.set_caret(8); // on "world"
+        assert_eq!(e.copy_text(), "world\n");
+    }
+
+    #[test]
+    fn cut_removes_selection_or_line() {
+        let mut e = Editor::from_text("hello\nworld\n");
+        e.selections = vec![Selection::new(0, 5)];
+        assert_eq!(e.cut(), "hello");
+        assert_eq!(text(&e), "\nworld\n");
+        e.set_caret(1); // on "world"
+        assert_eq!(e.cut(), "world\n");
+        assert_eq!(text(&e), "\n");
+    }
+
+    #[test]
+    fn indent_and_dedent_round_trip() {
+        let mut e = Editor::from_text("a\nb\nc\n");
+        e.selections = vec![Selection::new(0, 3)]; // covers lines 0..=1
+        e.indent_lines(4);
+        assert_eq!(text(&e), "    a\n    b\nc\n");
+        e.dedent_lines(4);
+        assert_eq!(text(&e), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn dedent_caret_stops_at_partial_indent() {
+        let mut e = Editor::from_text("  x\n");
+        e.set_caret(3); // after x
+        e.dedent_lines(4);
+        assert_eq!(text(&e), "x\n");
+    }
+
+    #[test]
+    fn toggle_comment_adds_then_removes() {
+        let mut e = Editor::from_text("fn main() {}\n");
+        e.select_all();
+        e.toggle_line_comment("// ");
+        assert_eq!(text(&e), "// fn main() {}\n");
+        e.select_all();
+        e.toggle_line_comment("// ");
+        assert_eq!(text(&e), "fn main() {}\n");
+    }
+
+    #[test]
+    fn toggle_comment_respects_indentation() {
+        let mut e = Editor::from_text("    let x = 1;\n");
+        e.set_caret(0);
+        e.toggle_line_comment("// ");
+        assert_eq!(text(&e), "    // let x = 1;\n");
+    }
+
+    #[test]
+    fn move_line_down_and_up() {
+        let mut e = Editor::from_text("one\ntwo\nthree");
+        e.set_caret(0); // line 0 "one"
+        e.move_lines(true);
+        assert_eq!(text(&e), "two\none\nthree");
+        // caret now on the moved "one" (line 1); move it back up.
+        e.move_lines(false);
+        assert_eq!(text(&e), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn move_line_down_into_last_line_keeps_text() {
+        let mut e = Editor::from_text("a\nb\nc");
+        e.set_caret(2); // line 1 "b"
+        e.move_lines(true);
+        assert_eq!(text(&e), "a\nc\nb");
+    }
+
+    #[test]
+    fn select_next_occurrence_adds_cursor() {
+        let mut e = Editor::from_text("foo bar foo baz foo");
+        e.set_caret(0);
+        assert!(e.select_word()); // selects first "foo"
+        assert!(e.select_next_occurrence()); // second "foo"
+        assert_eq!(e.selections().len(), 2);
+        assert!(e.select_next_occurrence()); // third "foo"
+        assert_eq!(e.selections().len(), 3);
     }
 
     #[test]

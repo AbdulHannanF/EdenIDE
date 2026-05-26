@@ -213,6 +213,8 @@ pub struct TextSystem {
     aux_buf: CtBuffer,
     fonts: HashMap<fontdb::ID, FontData>,
     scale: f64,
+    /// User-preferred editor font size in logical pixels (Ctrl+=/Ctrl+-).
+    font_logical: f64,
     font_size_px: f64,
     line_h: f64,
     advance: f64,
@@ -235,7 +237,8 @@ impl TextSystem {
                 tracing::debug!("JetBrains Mono not found, falling back to Consolas");
                 "Consolas"
             });
-        let (font_size_px, line_h) = Self::metrics_for(scale);
+        let font_logical = FONT_SIZE;
+        let (font_size_px, line_h) = metrics_for(font_logical, scale);
         let metrics = Metrics::new(font_size_px as f32, line_h as f32);
         let text_buf = CtBuffer::new(&mut font_system, metrics);
         let aux_buf = CtBuffer::new(&mut font_system, metrics);
@@ -245,6 +248,7 @@ impl TextSystem {
             aux_buf,
             fonts: HashMap::new(),
             scale,
+            font_logical,
             font_size_px,
             line_h,
             advance: font_size_px * 0.6,
@@ -299,9 +303,27 @@ impl TextSystem {
         self.advance * digits as f64 + 28.0 * self.scale
     }
 
-    fn metrics_for(scale: f64) -> (f64, f64) {
-        let font_size_px = FONT_SIZE * scale;
-        (font_size_px, font_size_px * LINE_HEIGHT_FACTOR)
+    /// Sets the editor font size (logical px, clamped 9–28) and re-derives the
+    /// line height and advance. Used by the Ctrl+= / Ctrl+- zoom keys.
+    pub fn set_font_size(&mut self, logical_px: f64) {
+        let logical_px = logical_px.clamp(9.0, 28.0);
+        if (logical_px - self.font_logical).abs() < f64::EPSILON {
+            return;
+        }
+        self.font_logical = logical_px;
+        let (font_size_px, line_h) = metrics_for(self.font_logical, self.scale);
+        self.font_size_px = font_size_px;
+        self.line_h = line_h;
+        let metrics = Metrics::new(font_size_px as f32, line_h as f32);
+        self.text_buf.set_metrics(metrics);
+        self.aux_buf.set_metrics(metrics);
+        self.measure_advance();
+    }
+
+    /// The current editor font size in logical pixels.
+    #[must_use]
+    pub fn font_size_logical(&self) -> f64 {
+        self.font_logical
     }
 
     fn ensure_metrics(&mut self, scale: f64) {
@@ -309,7 +331,7 @@ impl TextSystem {
             return;
         }
         self.scale = scale;
-        let (font_size_px, line_h) = Self::metrics_for(scale);
+        let (font_size_px, line_h) = metrics_for(self.font_logical, scale);
         self.font_size_px = font_size_px;
         self.line_h = line_h;
         let metrics = Metrics::new(font_size_px as f32, line_h as f32);
@@ -1354,6 +1376,19 @@ impl TextSystem {
             );
             x += dot + 5.0 * scale;
             self.draw_text(scene, branch, x, baseline, muted);
+            x += branch.len() as f64 * self.advance + 14.0 * scale;
+        }
+
+        // Diagnostic counts, after the branch.
+        let (errors, warnings) = view.diagnostics;
+        if errors > 0 {
+            let txt = format!("\u{2297} {errors}");
+            self.draw_text(scene, &txt, x, baseline, with_alpha(MARK_ERROR, 0xDD));
+            x += txt.len() as f64 * self.advance + 10.0 * scale;
+        }
+        if warnings > 0 {
+            let txt = format!("\u{26A0} {warnings}");
+            self.draw_text(scene, &txt, x, baseline, with_alpha(MARK_WARN, 0xDD));
         }
 
         // Right: "Ln N, Col N" — estimated advance for right-alignment.
@@ -1367,6 +1402,13 @@ impl TextSystem {
             let lang_w = lang.len() as f64 * self.advance;
             let lang_x = pos_x - lang_w - 16.0 * scale;
             self.draw_text(scene, lang, lang_x, baseline, muted);
+        }
+
+        // Transient message, centred and tinted with the accent.
+        if let Some(msg) = view.message {
+            let w = msg.len() as f64 * self.advance;
+            let mx = (area.x0 + area.x1 - w) * 0.5;
+            self.draw_text(scene, msg, mx.max(x + 12.0 * scale), baseline, palette.accent);
         }
     }
 
@@ -1429,6 +1471,12 @@ impl TextSystem {
 
 fn with_alpha(color: Rgba8, alpha: u8) -> Rgba8 {
     Rgba8::rgba(color.r, color.g, color.b, alpha)
+}
+
+/// Physical `(font_size, line_height)` for a logical font size and display scale.
+fn metrics_for(logical: f64, scale: f64) -> (f64, f64) {
+    let font_size_px = logical * scale;
+    (font_size_px, font_size_px * LINE_HEIGHT_FACTOR)
 }
 
 fn shape_buffer(
@@ -1512,6 +1560,10 @@ pub struct StatusBarView<'a> {
     pub line: usize,
     /// 1-based column number of the primary caret.
     pub col: usize,
+    /// LSP diagnostic counts as `(errors, warnings)`.
+    pub diagnostics: (usize, usize),
+    /// A transient message (save confirmation, etc.), centred when present.
+    pub message: Option<&'a str>,
 }
 
 // ── scrubber ──────────────────────────────────────────────────────────────────
