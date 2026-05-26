@@ -353,6 +353,12 @@ impl Chrome {
         self.terminal_open
     }
 
+    /// The absolute rect of the title bar (used for the top menu bar).
+    #[must_use]
+    pub fn title_bar_rect(&self) -> Rect {
+        self.region_rect(Region::TitleBar)
+    }
+
     /// The absolute rect of the editor canvas, where text is drawn.
     #[must_use]
     pub fn editor_rect(&self) -> Rect {

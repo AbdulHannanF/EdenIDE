@@ -218,6 +218,18 @@ pub struct FindBarView<'a> {
     pub whole_word: bool,
 }
 
+/// A single row in a popup menu for [`TextSystem::paint_menu`].
+pub struct MenuItemView<'a> {
+    /// The item's label (ignored when `separator` is true).
+    pub label: &'a str,
+    /// Optional right-aligned shortcut hint (e.g. "Ctrl+S").
+    pub shortcut: Option<&'a str>,
+    /// When true, this entry renders as a divider instead of a clickable row.
+    pub separator: bool,
+    /// Whether the item is clickable (greyed out when false).
+    pub enabled: bool,
+}
+
 /// A single tab label for [`TextSystem::paint_tabs`].
 pub struct TabLabel<'a> {
     /// Display name (usually the file's basename, or "untitled").
@@ -1706,6 +1718,112 @@ impl TextSystem {
         let tx = rect.x0 + (rect.width() - w) * 0.5;
         let baseline = rect.y0 + rect.height() * 0.5 + self.font_size_px * 0.34;
         self.draw_text(scene, label, tx.max(rect.x0 + 4.0 * scale), baseline, palette.accent);
+    }
+
+    // ── menu bar & popup menus (A2/A3) ────────────────────────────────────
+
+    /// Paints the top menu-bar labels over `area`, highlighting the open menu.
+    /// Returns the clickable rect for each label.
+    pub fn paint_menu_bar(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        labels: &[&str],
+        open: Option<usize>,
+        palette: &Palette,
+        scale: f64,
+    ) -> Vec<Rect> {
+        self.ensure_metrics(scale);
+        let mut hits = Vec::with_capacity(labels.len());
+        let pad = 10.0 * scale;
+        let baseline = area.y0 + (area.height() + self.font_size_px) * 0.5;
+        let mut x = area.x0 + 8.0 * scale;
+        for (i, label) in labels.iter().enumerate() {
+            let w = label.chars().count() as f64 * self.advance + pad * 2.0;
+            let r = Rect::new(x, area.y0 + 4.0 * scale, x + w, area.y1 - 4.0 * scale);
+            let is_open = open == Some(i);
+            if is_open {
+                fill_rrect(scene, r, 5.0 * scale, with_alpha(palette.text_muted, 0x2E));
+            }
+            let color = if is_open { palette.text } else { with_alpha(palette.text, 0xC8) };
+            self.draw_text(scene, label, x + pad, baseline, color);
+            hits.push(r);
+            x += w + 2.0 * scale;
+        }
+        hits
+    }
+
+    /// Paints a floating popup menu anchored near `(origin_x, origin_y)`,
+    /// clamped to `screen`. Returns `(entry_index, rect)` for each clickable
+    /// item; the optional `hovered` entry index is drawn with a highlight.
+    pub fn paint_menu(
+        &mut self,
+        scene: &mut Scene,
+        screen: Rect,
+        origin: Point,
+        entries: &[MenuItemView<'_>],
+        hovered: Option<usize>,
+        palette: &Palette,
+    ) -> Vec<(usize, Rect)> {
+        let scale = self.scale;
+        let row_h = 26.0 * scale;
+        let sep_h = 7.0 * scale;
+        let pad = 14.0 * scale;
+        let mut width = 140.0 * scale;
+        for e in entries {
+            if e.separator {
+                continue;
+            }
+            let lw = e.label.chars().count() as f64 * self.advance;
+            let sw = e.shortcut.map_or(0.0, |s| s.chars().count() as f64 * self.advance + 28.0 * scale);
+            width = width.max(lw + sw + pad * 2.0);
+        }
+        let height: f64 = entries
+            .iter()
+            .map(|e| if e.separator { sep_h } else { row_h })
+            .sum::<f64>()
+            + 8.0 * scale;
+        let x0 = origin.x.min(screen.x1 - width).max(screen.x0);
+        let y0 = origin.y.min(screen.y1 - height).max(screen.y0);
+        let panel = Rect::new(x0, y0, x0 + width, y0 + height);
+        // Drop shadow then panel.
+        fill_rrect(
+            scene,
+            Rect::new(panel.x0 + 2.0 * scale, panel.y0 + 4.0 * scale, panel.x1 + 2.0 * scale, panel.y1 + 4.0 * scale),
+            10.0 * scale,
+            Rgba8::rgba(0, 0, 0, 0x4D),
+        );
+        fill_rrect(scene, panel, 10.0 * scale, palette.surface_raised);
+        let mut hits = Vec::new();
+        let mut y = y0 + 4.0 * scale;
+        for (i, e) in entries.iter().enumerate() {
+            if e.separator {
+                let sy = y + sep_h * 0.5;
+                fill_rect(
+                    scene,
+                    Rect::new(x0 + 8.0 * scale, sy, x0 + width - 8.0 * scale, sy + scale.max(1.0)),
+                    palette.divider,
+                );
+                y += sep_h;
+                continue;
+            }
+            let row = Rect::new(x0 + 4.0 * scale, y, x0 + width - 4.0 * scale, y + row_h);
+            if hovered == Some(i) && e.enabled {
+                fill_rrect(scene, row, 5.0 * scale, with_alpha(palette.accent, 0x24));
+            }
+            let baseline = y + (row_h + self.font_size_px) * 0.5;
+            let color = if e.enabled { with_alpha(palette.text, 0xF0) } else { with_alpha(palette.text_muted, 0x80) };
+            self.draw_text(scene, e.label, row.x0 + pad - 4.0 * scale, baseline, color);
+            if let Some(sc) = e.shortcut {
+                let sw = sc.chars().count() as f64 * self.advance;
+                self.draw_text(scene, sc, panel.x1 - pad - sw, baseline, with_alpha(palette.text_muted, 0xB0));
+            }
+            if e.enabled {
+                hits.push((i, row));
+            }
+            y += row_h;
+        }
+        hits
     }
 
     // ── shared drawing helpers ────────────────────────────────────────────

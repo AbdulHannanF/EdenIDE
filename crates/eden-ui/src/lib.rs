@@ -16,9 +16,9 @@ pub use paint::{fill_rect, fill_rrect, to_color};
 pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TerminalPanel, TitleBar};
 pub use text::{
     CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, EditorFrame, FindBarHits,
-    FindBarView, GutterMark, MinimapView, PaletteView, SearchPanelView, SearchRowView,
-    ScrubberView, SettingsToggle, SettingsView, StatusBarView, TabHit, TabLabel, TerminalView,
-    TextSystem, TreeRow, TreeView,
+    FindBarView, GutterMark, MenuItemView, MinimapView, PaletteView, SearchPanelView,
+    SearchRowView, ScrubberView, SettingsToggle, SettingsView, StatusBarView, TabHit, TabLabel,
+    TerminalView, TextSystem, TreeRow, TreeView,
 };
 pub use paint::to_rgba8_alpha;
 pub use widget::{PaintCtx, Widget};

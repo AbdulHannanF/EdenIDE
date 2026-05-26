@@ -26,9 +26,10 @@ use eden_terminal::TerminalBackend;
 use eden_theme::Rgba8;
 use eden_ui::{
     Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
-    EditorFrame, FindBarHits, FindBarView, GutterMark, Highlighter, Highlights, MinimapView,
-    PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle, SettingsView,
-    StatusBarView, TabHit, TabLabel, TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
+    EditorFrame, FindBarHits, FindBarView, GutterMark, Highlighter, Highlights, MenuItemView,
+    MinimapView, PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle,
+    SettingsView, StatusBarView, TabHit, TabLabel, TerminalView, TextSystem, TreeRow, TreeView,
+    fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -142,6 +143,15 @@ fn comment_token_for_path(path: Option<&std::path::Path>) -> &'static str {
 /// Whether a byte is part of an identifier (used for whole-word find).
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Opens the OS file explorer with `path` selected (Windows `explorer /select`).
+fn reveal_in_explorer(path: Option<&Path>) {
+    let Some(path) = path else { return };
+    let arg = format!("/select,{}", path.display());
+    if let Err(err) = std::process::Command::new("explorer").arg(arg).spawn() {
+        tracing::warn!("reveal in explorer failed: {err}");
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -428,6 +438,127 @@ fn tab_name(path: Option<&Path>) -> &str {
     path.and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("untitled")
 }
 
+// ── menus (A2 context menus / A3 menu bar) ───────────────────────────────────
+
+/// The top-level menu-bar titles, left to right.
+const MENU_BAR: [&str; 7] = ["File", "Edit", "View", "Go", "Run", "Terminal", "Help"];
+
+/// An action triggered by clicking a menu item.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuAction {
+    NewFile,
+    OpenFile,
+    Save,
+    SaveAs,
+    CloseTab,
+    CloseOthers,
+    CloseAll,
+    Quit,
+    Undo,
+    Redo,
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+    Find,
+    Replace,
+    GotoLine,
+    GotoDefinition,
+    FilePalette,
+    CommandPalette,
+    ProjectSearch,
+    ToggleSidebar,
+    ToggleTerminal,
+    ToggleMinimap,
+    ToggleScrubber,
+    CycleTheme,
+    Settings,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    CopyPath,
+    RevealInExplorer,
+    About,
+}
+
+/// One row of a menu: either a clickable action or a divider.
+enum MenuEntry {
+    Item { label: &'static str, shortcut: Option<&'static str>, action: MenuAction },
+    Sep,
+}
+
+impl MenuEntry {
+    fn item(label: &'static str, shortcut: Option<&'static str>, action: MenuAction) -> Self {
+        MenuEntry::Item { label, shortcut, action }
+    }
+}
+
+/// An open popup menu (menu-bar dropdown or right-click context menu).
+struct MenuState {
+    entries: Vec<MenuEntry>,
+    origin: (f64, f64),
+    hits: Vec<(usize, Rect)>,
+    target_tab: Option<usize>,
+    target_path: Option<PathBuf>,
+}
+
+/// Builds the dropdown entries for top-level menu-bar index `i`.
+fn menu_bar_dropdown(i: usize) -> Vec<MenuEntry> {
+    use MenuAction as A;
+    let it = MenuEntry::item;
+    match i {
+        0 => vec![
+            it("New File", Some("Ctrl+N"), A::NewFile),
+            it("Open File…", Some("Ctrl+O"), A::OpenFile),
+            MenuEntry::Sep,
+            it("Save", Some("Ctrl+S"), A::Save),
+            it("Save As…", Some("Ctrl+Shift+S"), A::SaveAs),
+            MenuEntry::Sep,
+            it("Close Tab", Some("Ctrl+W"), A::CloseTab),
+            it("Exit", None, A::Quit),
+        ],
+        1 => vec![
+            it("Undo", Some("Ctrl+Z"), A::Undo),
+            it("Redo", Some("Ctrl+Y"), A::Redo),
+            MenuEntry::Sep,
+            it("Cut", Some("Ctrl+X"), A::Cut),
+            it("Copy", Some("Ctrl+C"), A::Copy),
+            it("Paste", Some("Ctrl+V"), A::Paste),
+            it("Select All", Some("Ctrl+A"), A::SelectAll),
+            MenuEntry::Sep,
+            it("Find", Some("Ctrl+F"), A::Find),
+            it("Replace", Some("Ctrl+H"), A::Replace),
+        ],
+        2 => vec![
+            it("Toggle Sidebar", Some("Ctrl+B"), A::ToggleSidebar),
+            it("Toggle Terminal", Some("Ctrl+`"), A::ToggleTerminal),
+            it("Toggle Minimap", Some("Ctrl+M"), A::ToggleMinimap),
+            it("Time Scrubber", Some("Ctrl+Shift+H"), A::ToggleScrubber),
+            MenuEntry::Sep,
+            it("Cycle Theme", Some("Ctrl+T"), A::CycleTheme),
+            it("Settings", Some("Ctrl+,"), A::Settings),
+            MenuEntry::Sep,
+            it("Zoom In", Some("Ctrl+="), A::ZoomIn),
+            it("Zoom Out", Some("Ctrl+-"), A::ZoomOut),
+            it("Reset Zoom", Some("Ctrl+0"), A::ZoomReset),
+        ],
+        3 => vec![
+            it("Go to Line…", Some("Ctrl+G"), A::GotoLine),
+            it("Go to Definition", Some("F12"), A::GotoDefinition),
+            MenuEntry::Sep,
+            it("Go to File…", Some("Ctrl+P"), A::FilePalette),
+            it("Command Palette…", Some("Ctrl+Shift+P"), A::CommandPalette),
+            it("Find in Files…", Some("Ctrl+Shift+F"), A::ProjectSearch),
+        ],
+        4 => vec![
+            it("Command Palette…", Some("Ctrl+Shift+P"), A::CommandPalette),
+            it("Open Terminal", Some("Ctrl+`"), A::ToggleTerminal),
+        ],
+        5 => vec![it("Toggle Terminal", Some("Ctrl+`"), A::ToggleTerminal)],
+        _ => vec![it("About Eden", None, A::About)],
+    }
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 struct App {
@@ -508,6 +639,13 @@ struct App {
     tabs: Vec<OpenTab>,
     active_tab: usize,
     tab_hits: Vec<TabHit>,
+
+    // Menu bar (A3) + context menus (A2).
+    menu: Option<MenuState>,
+    menu_bar_open: Option<usize>,
+    menubar_hits: Vec<Rect>,
+    menu_hover: Option<usize>,
+    pending_quit: bool,
 
     // Find / replace (Ctrl+F / Ctrl+H) and go-to-line (Ctrl+G).
     find_open: bool,
@@ -600,6 +738,11 @@ impl App {
             tabs: vec![OpenTab::new(None)],
             active_tab: 0,
             tab_hits: Vec::new(),
+            menu: None,
+            menu_bar_open: None,
+            menubar_hits: Vec::new(),
+            menu_hover: None,
+            pending_quit: false,
             find_open: false,
             find: FindState::default(),
             find_hits: None,
@@ -878,6 +1021,10 @@ impl App {
     /// Closes the topmost open overlay (palette, search, completion, etc).
     /// Returns whether anything was closed.
     fn close_top_overlay(&mut self) -> bool {
+        if self.menu.is_some() {
+            self.close_menu();
+            return true;
+        }
         if self.goto_open {
             self.goto_open = false;
             return true;
@@ -1130,6 +1277,228 @@ impl App {
         let at = self.editor.buffer().line_to_char(line);
         self.editor.set_selection(at, at);
         self.ensure_visible = true;
+    }
+
+    // ── menu bar & context menus (A2/A3) ────────────────────────────────────
+
+    /// Closes any open menu (dropdown or context menu).
+    fn close_menu(&mut self) {
+        self.menu = None;
+        self.menu_bar_open = None;
+        self.menu_hover = None;
+    }
+
+    /// Opens (or, if already open, closes) the menu-bar dropdown `i`.
+    fn toggle_menu_bar(&mut self, i: usize) {
+        if self.menu_bar_open == Some(i) {
+            self.close_menu();
+            return;
+        }
+        let origin = self
+            .menubar_hits
+            .get(i)
+            .map_or((8.0 + i as f64 * 60.0, 38.0), |r| (r.x0, r.y1));
+        self.menu_bar_open = Some(i);
+        self.menu_hover = None;
+        self.menu = Some(MenuState {
+            entries: menu_bar_dropdown(i),
+            origin,
+            hits: Vec::new(),
+            target_tab: None,
+            target_path: None,
+        });
+    }
+
+    /// Opens a right-click context menu appropriate to the region under the
+    /// cursor (tab strip, sidebar, or editor).
+    fn on_right_click(&mut self) -> bool {
+        let Some(point) = self.cursor else { return false };
+        use MenuAction as A;
+        let it = MenuEntry::item;
+
+        // Tab strip → tab actions targeting the clicked tab.
+        if let Some(i) = self.tab_hits.iter().position(|h| h.body.contains(point)) {
+            self.open_context_menu(
+                point,
+                vec![
+                    it("Close", Some("Ctrl+W"), A::CloseTab),
+                    it("Close Others", None, A::CloseOthers),
+                    it("Close All", None, A::CloseAll),
+                ],
+                Some(i),
+                None,
+            );
+            return true;
+        }
+
+        // Sidebar → file actions targeting the clicked entry.
+        if self.over_sidebar() {
+            let path = self.tree_row_at(point).map(|idx| self.tree.entries()[idx].path.clone());
+            self.open_context_menu(
+                point,
+                vec![
+                    it("Copy Path", None, A::CopyPath),
+                    it("Reveal in File Explorer", None, A::RevealInExplorer),
+                ],
+                None,
+                path,
+            );
+            return true;
+        }
+
+        // Editor canvas → editing actions.
+        if self.chrome.as_ref().is_some_and(|c| c.editor_rect().contains(point)) {
+            self.open_context_menu(
+                point,
+                vec![
+                    it("Cut", Some("Ctrl+X"), A::Cut),
+                    it("Copy", Some("Ctrl+C"), A::Copy),
+                    it("Paste", Some("Ctrl+V"), A::Paste),
+                    MenuEntry::Sep,
+                    it("Select All", Some("Ctrl+A"), A::SelectAll),
+                    MenuEntry::Sep,
+                    it("Find", Some("Ctrl+F"), A::Find),
+                    it("Go to Definition", Some("F12"), A::GotoDefinition),
+                    it("Command Palette…", Some("Ctrl+Shift+P"), A::CommandPalette),
+                ],
+                None,
+                None,
+            );
+            return true;
+        }
+        false
+    }
+
+    fn open_context_menu(
+        &mut self,
+        at: Point,
+        entries: Vec<MenuEntry>,
+        target_tab: Option<usize>,
+        target_path: Option<PathBuf>,
+    ) {
+        self.menu_bar_open = None;
+        self.menu_hover = None;
+        self.menu = Some(MenuState {
+            entries,
+            origin: (at.x, at.y),
+            hits: Vec::new(),
+            target_tab,
+            target_path,
+        });
+    }
+
+    /// Runs the action for a clicked menu item, then closes the menu.
+    fn run_menu_action(&mut self, action: MenuAction) {
+        use MenuAction as A;
+        let target_tab = self.menu.as_ref().and_then(|m| m.target_tab);
+        let target_path = self.menu.as_ref().and_then(|m| m.target_path.clone());
+        self.close_menu();
+        match action {
+            A::NewFile => self.new_file(),
+            A::OpenFile => self.open_file_dialog(),
+            A::Save => self.save_current(),
+            A::SaveAs => self.save_current_as(),
+            A::CloseTab => self.close_tab(target_tab.unwrap_or(self.active_tab)),
+            A::CloseOthers => self.close_other_tabs(target_tab.unwrap_or(self.active_tab)),
+            A::CloseAll => self.close_all_tabs(),
+            A::Quit => self.pending_quit = true,
+            A::Undo => {
+                self.edit(true, |e| {
+                    e.undo();
+                });
+            }
+            A::Redo => {
+                self.edit(true, |e| {
+                    e.redo();
+                });
+            }
+            A::Cut => self.clipboard_cut(),
+            A::Copy => self.clipboard_copy(),
+            A::Paste => self.clipboard_paste(),
+            A::SelectAll => {
+                self.edit(false, Editor::select_all);
+            }
+            A::Find => self.open_find(false),
+            A::Replace => self.open_find(true),
+            A::GotoLine => self.open_goto(),
+            A::GotoDefinition => self.go_to_definition(),
+            A::FilePalette => self.open_palette(),
+            A::CommandPalette => self.open_cmd_palette(),
+            A::ProjectSearch => self.search_open = true,
+            A::ToggleSidebar => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.toggle_sidebar();
+                }
+            }
+            A::ToggleTerminal => self.toggle_terminal(),
+            A::ToggleMinimap => self.minimap_open = !self.minimap_open,
+            A::ToggleScrubber => self.scrubber_open = !self.scrubber_open,
+            A::CycleTheme => {
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.cycle_theme();
+                }
+            }
+            A::Settings => self.settings_open = !self.settings_open,
+            A::ZoomIn => self.adjust_font_size(1.0),
+            A::ZoomOut => self.adjust_font_size(-1.0),
+            A::ZoomReset => {
+                if let Some(text) = &mut self.text {
+                    text.set_font_size(14.0);
+                }
+                self.settings.font_size = 14;
+            }
+            A::CopyPath => self.copy_path_to_clipboard(target_path.as_deref()),
+            A::RevealInExplorer => reveal_in_explorer(target_path.as_deref()),
+            A::About => self.toast("Eden — a GPU-rendered code editor in Rust"),
+        }
+    }
+
+    /// Closes every tab except `keep`, which becomes the sole active tab.
+    fn close_other_tabs(&mut self, keep: usize) {
+        if keep != self.active_tab {
+            self.activate_tab(keep);
+        }
+        self.tabs = vec![OpenTab::new(self.current_path.clone())];
+        self.active_tab = 0;
+    }
+
+    /// Closes every tab, leaving one blank untitled document.
+    fn close_all_tabs(&mut self) {
+        self.tabs = vec![OpenTab::new(None)];
+        self.active_tab = 0;
+        self.reset_live_doc(Editor::from_text(""), None, None);
+    }
+
+    /// Copies a file path to the system clipboard.
+    fn copy_path_to_clipboard(&mut self, path: Option<&Path>) {
+        let Some(path) = path else { return };
+        let text = path.display().to_string();
+        if let Some(cb) = &mut self.clipboard
+            && let Err(err) = cb.set_text(text)
+        {
+            tracing::warn!("clipboard copy failed: {err}");
+        }
+        self.toast("Path copied");
+    }
+
+    /// Updates the menu-item hover highlight (and switches dropdowns when the
+    /// cursor crosses to another menu-bar label).
+    fn update_menu_hover(&mut self, point: Point) {
+        if self.menu.is_none() {
+            return;
+        }
+        // Hover-switch between menu-bar dropdowns.
+        if self.menu_bar_open.is_some()
+            && let Some(i) = self.menubar_hits.iter().position(|r| r.contains(point))
+            && self.menu_bar_open != Some(i)
+        {
+            self.toggle_menu_bar(i);
+            return;
+        }
+        self.menu_hover = self
+            .menu
+            .as_ref()
+            .and_then(|m| m.hits.iter().find(|(_, r)| r.contains(point)).map(|(idx, _)| *idx));
     }
 
     fn on_command(&mut self, key: &str, shift: bool) -> bool {
@@ -2103,6 +2472,34 @@ impl App {
     fn on_click(&mut self) -> bool {
         let Some(point) = self.cursor else { return false };
 
+        // Open menu: click an item to run it, click outside to dismiss.
+        if self.menu.is_some() {
+            let mut clicked: Option<MenuAction> = None;
+            if let Some(menu) = &self.menu
+                && let Some((idx, _)) = menu.hits.iter().find(|(_, r)| r.contains(point))
+                && let MenuEntry::Item { action, .. } = &menu.entries[*idx]
+            {
+                clicked = Some(*action);
+            }
+            if let Some(action) = clicked {
+                self.run_menu_action(action);
+                return true;
+            }
+            // Click on a menu-bar label switches/closes; anywhere else dismisses.
+            if let Some(i) = self.menubar_hits.iter().position(|r| r.contains(point)) {
+                self.toggle_menu_bar(i);
+            } else {
+                self.close_menu();
+            }
+            return true;
+        }
+
+        // Menu-bar label → open its dropdown.
+        if let Some(i) = self.menubar_hits.iter().position(|r| r.contains(point)) {
+            self.toggle_menu_bar(i);
+            return true;
+        }
+
         // Tab strip: activate (body) or close (×) a tab.
         let tab_action = self.tab_hits.iter().enumerate().find_map(|(i, h)| {
             if h.close.contains(point) {
@@ -2403,6 +2800,14 @@ impl App {
 
         if let Some(chrome) = &mut self.chrome {
             chrome.paint(&mut self.scene);
+        }
+
+        // Top menu bar (A3) over the title-bar strip.
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let area = chrome.title_bar_rect();
+            let palette = chrome.palette();
+            self.menubar_hits =
+                text.paint_menu_bar(&mut self.scene, area, &MENU_BAR, self.menu_bar_open, &palette, self.scale);
         }
 
         // Tab bar: overlay the open-document tabs over the tab strip background
@@ -2815,6 +3220,50 @@ impl App {
             );
         }
 
+        // Popup menu (menu-bar dropdown or right-click context menu) — topmost.
+        if self.menu.is_some() {
+            let views: Vec<MenuItemView<'_>> = self
+                .menu
+                .as_ref()
+                .map(|m| {
+                    m.entries
+                        .iter()
+                        .map(|e| match e {
+                            MenuEntry::Sep => MenuItemView {
+                                label: "",
+                                shortcut: None,
+                                separator: true,
+                                enabled: false,
+                            },
+                            MenuEntry::Item { label, shortcut, .. } => MenuItemView {
+                                label,
+                                shortcut: *shortcut,
+                                separator: false,
+                                enabled: true,
+                            },
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let origin = self.menu.as_ref().map_or((0.0, 0.0), |m| m.origin);
+            let hover = self.menu_hover;
+            if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+                let screen = Rect::new(0.0, 0.0, f64::from(width), f64::from(height));
+                let palette = chrome.palette();
+                let hits = text.paint_menu(
+                    &mut self.scene,
+                    screen,
+                    Point::new(origin.0, origin.1),
+                    &views,
+                    hover,
+                    &palette,
+                );
+                if let Some(menu) = &mut self.menu {
+                    menu.hits = hits;
+                }
+            }
+        }
+
         let device_handle = &self.context.devices[dev_id];
         let renderer = self.renderers[dev_id]
             .as_mut()
@@ -2959,6 +3408,7 @@ impl ApplicationHandler for App {
                     chrome.set_hover(Some(point));
                 }
                 self.tree_hover = self.tree_row_at(point);
+                self.update_menu_hover(point);
                 self.cursor_still_since = Instant::now();
                 self.hover_requested_for = None;
                 if let Some(path) = &self.current_path.clone() {
@@ -2982,9 +3432,21 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 let changed = self.on_click();
+                if self.pending_quit {
+                    event_loop.exit();
+                    return;
+                }
                 if changed {
                     self.request_redraw();
                 }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                self.on_right_click();
+                self.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let line_h = self.text.as_ref().map_or(20.0, TextSystem::line_height);
