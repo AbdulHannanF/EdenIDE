@@ -1524,11 +1524,103 @@ impl TextSystem {
         Some(bar)
     }
 
+    // ── activity bar ──────────────────────────────────────────────────────
+
+    /// Paints the section labels (EDITOR / SEARCH / TERM / GIT) into the top
+    /// 32px zone of the title-bar rect.  The active section gets a 2px accent
+    /// bottom border; inactive ones are shown in `fg_dim`.
+    pub fn paint_activity_bar(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &ActivityBarView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        let activity_h = 32.0 * scale;
+        let bar = Rect::new(area.x0, area.y0, area.x1, area.y0 + activity_h);
+        // Vertically centre text within the 32px band.
+        let baseline = bar.y0 + (activity_h + self.font_size_px * 0.72) * 0.5;
+        // Leave 120px on the right for the window control circles.
+        let avail_x1 = bar.x1 - 120.0 * scale;
+        let pad = 14.0 * scale;
+        let gap = 20.0 * scale;
+        let sections: &[&str] = &["EDITOR", "SEARCH", "TERM", "GIT"];
+        let mut x = bar.x0 + pad;
+        for &label in sections {
+            let lw = label.chars().count() as f64 * self.advance;
+            if x + lw > avail_x1 {
+                break;
+            }
+            let is_active = label == view.active;
+            let color = if is_active { palette.text } else { palette.fg_dim };
+            self.draw_text(scene, label, x, baseline, color);
+            if is_active {
+                let uh = 2.0 * scale;
+                fill_rect(
+                    scene,
+                    Rect::new(x, bar.y1 - uh, x + lw, bar.y1),
+                    palette.accent,
+                );
+            }
+            x += lw + gap;
+        }
+    }
+
+    // ── breadcrumb bar ────────────────────────────────────────────────────
+
+    /// Paints the breadcrumb zone (bottom 36px of the title-bar rect).
+    /// Left side: "EDEN V0.1.0" label.  Right side: path segments like
+    /// `crates / eden-app / src / main.rs` (filename in `text_muted`, parents
+    /// in `fg_dim`).
+    pub fn paint_breadcrumb(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &BreadcrumbView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        let activity_h = 32.0 * scale;
+        let bar = Rect::new(area.x0, area.y0 + activity_h, area.x1, area.y1);
+        let baseline = bar.y0 + (bar.height() + self.font_size_px * 0.72) * 0.5;
+        let pad = 14.0 * scale;
+
+        // Left: "EDEN V0.1.0" brand label.
+        let brand = "EDEN V0.1.0";
+        self.draw_text(scene, brand, bar.x0 + pad, baseline, palette.fg_dim);
+
+        // Right: path segments.
+        if let Some(path) = view.path {
+            let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if segs.is_empty() {
+                return;
+            }
+            let sep = " / ";
+            let sep_w = sep.chars().count() as f64 * self.advance;
+            // Build total width to right-align.
+            let total_w: f64 = segs.iter().map(|s| s.chars().count() as f64 * self.advance).sum::<f64>()
+                + sep_w * (segs.len().saturating_sub(1)) as f64;
+            let brand_end = bar.x0 + pad + brand.chars().count() as f64 * self.advance + 16.0 * scale;
+            let start_x = (bar.x1 - total_w - pad).max(brand_end);
+            let mut cx = start_x;
+            for (i, seg) in segs.iter().enumerate() {
+                if i > 0 {
+                    self.draw_text(scene, sep, cx, baseline, palette.fg_dim);
+                    cx += sep_w;
+                }
+                let color = if i == segs.len() - 1 { palette.text_muted } else { palette.fg_dim };
+                self.draw_text(scene, seg, cx, baseline, color);
+                cx += seg.chars().count() as f64 * self.advance;
+            }
+        }
+    }
+
     // ── status bar ────────────────────────────────────────────────────────
 
-    /// Paints real text over the status bar: branch name on the left, language
-    /// and cursor position on the right. Called after `Chrome::paint` so the
-    /// bar background is already filled.
+    /// Paints the instrument-panel status bar into `area`.
     pub fn paint_status_bar(
         &mut self,
         scene: &mut Scene,
@@ -2074,6 +2166,22 @@ pub struct SettingsView<'a> {
     pub active_theme: usize,
     /// Feature toggles.
     pub toggles: &'a [SettingsToggle<'a>],
+}
+
+// ── activity bar ──────────────────────────────────────────────────────────────
+
+/// Everything needed to render the activity bar (top 32px of the title bar).
+pub struct ActivityBarView<'a> {
+    /// The currently active section label: `"EDITOR"`, `"SEARCH"`, `"TERM"`, `"GIT"`.
+    pub active: &'a str,
+}
+
+// ── breadcrumb bar ─────────────────────────────────────────────────────────────
+
+/// Everything needed to render the breadcrumb bar (bottom 36px of the title bar).
+pub struct BreadcrumbView<'a> {
+    /// Current file path (relative, forward-slash separated), or `None`.
+    pub path: Option<&'a str>,
 }
 
 // ── status bar ────────────────────────────────────────────────────────────────

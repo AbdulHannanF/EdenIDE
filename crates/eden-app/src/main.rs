@@ -25,11 +25,11 @@ use eden_search::{FuzzyMatcher, SearchHit, SearchQuery, search_project};
 use eden_terminal::TerminalBackend;
 use eden_theme::Rgba8;
 use eden_ui::{
-    Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DiffMark, Editor,
-    EditorFrame, FindBarHits, FindBarView, GutterMark, Highlighter, Highlights, MenuItemView,
-    MinimapView, PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle,
-    SettingsView, StatusBarView, TabHit, TabLabel, TerminalView, TextSystem, TreeRow, TreeView,
-    fill_rrect,
+    ActivityBarView, BreadcrumbView, Chrome, CmdEntry, CmdPaletteView, CompletionEntry,
+    CompletionView, DiffMark, Editor, EditorFrame, FindBarHits, FindBarView, GutterMark,
+    Highlighter, Highlights, MenuItemView, MinimapView, PaletteView, SearchPanelView,
+    SearchRowView, ScrubberView, SettingsToggle, SettingsView, StatusBarView, TabHit, TabLabel,
+    TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -669,6 +669,9 @@ struct App {
     goto_open: bool,
     goto_query: String,
 
+    /// Timestamp of the most recent mutating edit (for 4-second auto-save).
+    last_edit_time: Instant,
+
     cursor: Option<Point>,
     scroll: Spring,
     // design: horizontal scroll offset in physical pixels. No spring — pixel
@@ -765,6 +768,7 @@ impl App {
             find_hits: None,
             goto_open: false,
             goto_query: String::new(),
+            last_edit_time: Instant::now(),
             cursor: None,
             scroll: Spring::with_config(0.0, SpringConfig::DEFAULT),
             h_scroll: 0.0,
@@ -945,6 +949,7 @@ impl App {
                 self.editor.insert(s);
                 self.doc_dirty = true;
                 self.modified = true;
+                self.last_edit_time = Instant::now();
                 self.ensure_visible = true;
                 self.dismiss_completion();
                 // Bright spike on each keystroke (§7.6).
@@ -1727,6 +1732,7 @@ impl App {
                 self.editor.insert(&text);
                 self.doc_dirty = true;
                 self.modified = true;
+                self.last_edit_time = Instant::now();
                 self.ensure_visible = true;
             }
             Ok(_) => {}
@@ -1753,6 +1759,29 @@ impl App {
             return;
         };
         self.write_to(&path);
+    }
+
+    /// Auto-saves the active document after 4 s of typing inactivity.
+    fn check_autosave(&mut self) {
+        const AUTOSAVE_DELAY: Duration = Duration::from_secs(4);
+        if self.modified
+            && self.current_path.is_some()
+            && self.last_edit_time.elapsed() >= AUTOSAVE_DELAY
+        {
+            let path = self.current_path.clone().expect("checked above");
+            let contents = self.editor.buffer().to_string();
+            match std::fs::write(&path, &contents) {
+                Ok(()) => {
+                    self.modified = false;
+                    self.refresh_diff_marks();
+                    self.toast("AUTOSAVED");
+                    tracing::debug!(file = %path.display(), "autosaved");
+                }
+                Err(err) => {
+                    tracing::warn!(file = %path.display(), "autosave failed: {err}");
+                }
+            }
+        }
     }
 
     fn save_current_as(&mut self) {
@@ -2692,6 +2721,7 @@ impl App {
         if mutates {
             self.doc_dirty = true;
             self.modified = true;
+            self.last_edit_time = Instant::now();
             // Focus Halo: dim chrome on every mutating key.
             if let Some(chrome) = &mut self.chrome {
                 chrome.enter_typing();
@@ -2760,6 +2790,7 @@ impl App {
     // ── render ────────────────────────────────────────────────────────────
 
     fn render(&mut self) -> Result<()> {
+        self.check_autosave();
         self.refresh_highlights();
         self.clamp_scroll();
         self.ensure_caret_visible();
@@ -2900,6 +2931,44 @@ impl App {
                     fill_rrect(&mut self.scene, *rect, 0.0, hover_color);
                 }
             }
+        }
+
+        // Activity bar labels (EDITOR / SEARCH / TERM / GIT).
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let area = chrome.title_bar_rect();
+            let palette = chrome.palette();
+            let active_section = if self.search_open {
+                "SEARCH"
+            } else if self.terminal.as_ref().is_some_and(|_| chrome.terminal_open()) {
+                "TERM"
+            } else {
+                "EDITOR"
+            };
+            text.paint_activity_bar(
+                &mut self.scene,
+                area,
+                &ActivityBarView { active: active_section },
+                &palette,
+                self.scale,
+            );
+        }
+
+        // Breadcrumb bar (bottom 36px of title bar): EDEN label + file path.
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let area = chrome.title_bar_rect();
+            let palette = chrome.palette();
+            let rel_path = self.current_path.as_ref().and_then(|p| {
+                p.strip_prefix(self.project.root()).ok().map(|r| {
+                    r.to_string_lossy().replace('\\', "/")
+                })
+            });
+            text.paint_breadcrumb(
+                &mut self.scene,
+                area,
+                &BreadcrumbView { path: rel_path.as_deref() },
+                &palette,
+                self.scale,
+            );
         }
 
         // Tab bar: overlay the open-document tabs over the tab strip background
