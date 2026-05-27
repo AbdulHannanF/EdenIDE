@@ -87,21 +87,6 @@ All themes crossfade via spring animation on `Ctrl+T`.
 
 ---
 
-> **Status: Phase 3 — Syntax & Files.** On top of the editable buffer (Phase 2),
-> the editor now has **tree-sitter syntax highlighting** (Rust grammar; glyphs
-> coloured per highlight kind, crossfading with the theme), a **gitignore-aware
-> sidebar file tree** (lazy expand, virtual-scrolled, click to open), and
-> **Cmd-P fuzzy file open** (Ctrl+P; nucleo-ranked, opens into the editor).
->
-> Editing (Phase 2): ropey buffer, multi-cursor, selections, snapshot undo/redo
-> (typing coalesces), spring momentum scroll. Type to insert; arrows move (Shift
-> extends); Backspace/Delete/Home/End/Enter/Tab; Ctrl+Z / Ctrl+Shift+Z; Ctrl+A.
-> Ctrl+B toggles the sidebar, Ctrl+T crossfades the theme, Ctrl+P opens files.
->
-> Known gaps carried forward: incremental (InputEdit) re-highlighting, soft-wrap,
-> block/column selection, a pulsing caret, click-to-place-caret in the editor,
-> more grammars, and bundling JetBrains Mono (currently system Consolas).
-
 ## Architecture
 
 Eden is a Cargo workspace. The crate split is the load-bearing decision that has
@@ -136,13 +121,3 @@ cargo run -p eden-app        # or: cargo run --bin eden
 
 The first build compiles the full GPU stack (vello, wgpu, naga) and takes a few
 minutes. Subsequent builds are incremental.
-
-## Build plan
-
-Phase 0 Skeleton · Phase 1 The Surface · Phase 2 The Buffer · Phase 3 Syntax &
-Files · Phase 4 Intelligence (LSP) · Phase 5 Surroundings · Phase 6 Signature
-features · Phase 7 Polish.
-
-## License
-
-Licensed under either of Apache-2.0 or MIT at your option.

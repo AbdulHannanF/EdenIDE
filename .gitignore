@@ -1,7 +1,7 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
-
+claude-design/
 # Crash/profile dumps
 *.pdb
 profile.json
@@ -12,7 +12,8 @@ Thumbs.db
 .idea/
 .claude/
 .vscode/
-claude-design/
+
+
 CLAUDE.md
 Eden_Original_Idea.md
 text-dit.rar
