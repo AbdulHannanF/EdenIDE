@@ -113,6 +113,24 @@ impl GitRepo {
         }
     }
 
+    /// How many commits the current branch is ahead of its upstream remote.
+    ///
+    /// Returns `0` when HEAD is detached, the branch has no upstream, or the
+    /// graph walk fails for any reason (non-fatal — just show nothing).
+    #[must_use]
+    pub fn commits_ahead(&self) -> u32 {
+        let Ok(head) = self.repo.head() else { return 0 };
+        let Some(branch_name) = head.shorthand() else { return 0 };
+        let Ok(branch) = self.repo.find_branch(branch_name, git2::BranchType::Local) else { return 0 };
+        let Ok(upstream) = branch.upstream() else { return 0 };
+        let Ok(local_oid) = head.target().ok_or(()) else { return 0 };
+        let Some(upstream_ref) = upstream.into_reference().target() else { return 0 };
+        match self.repo.graph_ahead_behind(local_oid, upstream_ref) {
+            Ok((ahead, _)) => ahead as u32,
+            Err(_) => 0,
+        }
+    }
+
     // ── status ─────────────────────────────────────────────────────────────
 
     /// Returns VCS status for all modified/untracked files in the working tree.

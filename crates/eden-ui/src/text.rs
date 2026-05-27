@@ -93,6 +93,8 @@ pub struct TreeRow<'a> {
     pub is_dir: bool,
     /// Whether an expanded directory.
     pub expanded: bool,
+    /// Whether the file has uncommitted git changes.
+    pub git_modified: bool,
 }
 
 /// The sidebar file tree to render.
@@ -105,6 +107,10 @@ pub struct TreeView<'a> {
     pub hovered: Option<usize>,
     /// The row index of the currently open file, if visible.
     pub selected: Option<usize>,
+    /// Git branch name shown at the bottom of the sidebar.
+    pub branch: Option<&'a str>,
+    /// Total file count shown in the header (e.g. "04 / 47").
+    pub total_files: usize,
 }
 
 /// The command-palette content to render.
@@ -816,13 +822,38 @@ impl TextSystem {
         let count = ((area.height() + frac) / row_h).ceil() as usize + 1;
         let last = (first + count).min(rows.len());
 
-        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &area);
-        fill_rect(scene, area, palette.surface);
+        // Branch info footer (28px) at the very bottom of the sidebar.
+        let footer_h = 28.0 * scale;
+        let footer_y = area.y1 - footer_h;
+        fill_rect(scene, Rect::new(area.x0, footer_y, area.x1, area.y1), palette.surface);
+        fill_rect(
+            scene,
+            Rect::new(area.x0, footer_y, area.x1, footer_y + scale.max(1.0)),
+            palette.divider,
+        );
+        let footer_baseline = footer_y + (footer_h + self.font_size_px * 0.72) * 0.5;
+        let fpad = 12.0 * scale;
+        if let Some(branch) = view.branch {
+            let branch_txt = format!("BRANCH  {branch}");
+            self.draw_text(scene, &branch_txt, area.x0 + fpad, footer_baseline, palette.fg_dim);
+        }
 
-        // design: FIG header — "FIG. 01 — WORKSPACE" in fg_dim, 10px, uppercase.
+        let content_area = Rect::new(area.x0, area.y0, area.x1, footer_y);
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &content_area);
+        fill_rect(scene, content_area, palette.surface);
+
+        // FIG header with file count.
         let header_h = 28.0 * scale;
         let header_baseline = area.y0 + header_h * 0.72;
+        let visible_count = rows.iter().filter(|r| !r.is_dir).count();
+        let count_str = format!(
+            "{:02} / {:02}",
+            visible_count.min(99),
+            view.total_files.min(99)
+        );
+        let count_w = count_str.chars().count() as f64 * self.advance;
         self.draw_text(scene, "FIG. 01 \u{2014} WORKSPACE", area.x0 + 12.0 * scale, header_baseline, palette.fg_dim);
+        self.draw_text(scene, &count_str, area.x1 - count_w - 12.0 * scale, header_baseline, with_alpha(palette.fg_dim, 0xA0));
         // Bottom border under header.
         fill_rect(
             scene,
@@ -854,19 +885,20 @@ impl TextSystem {
             let pad_x = area.x0 + 12.0 * scale;
 
             if row.is_dir {
-                // Collapsed: "·  {indent}{name}", Expanded: "-  {indent}{name}"
                 let marker = if row.expanded { "-" } else { "\u{00B7}" };
                 let label = format!("{marker}  {indent_str}{}", row.name);
                 self.draw_text(scene, &label, pad_x, baseline, palette.text_muted);
             } else {
-                // File: "   {indent}{name}"
                 let label = format!("   {indent_str}{}", row.name);
-                let name_color = if selected == Some(i) {
-                    palette.text
-                } else {
-                    palette.text_muted
-                };
+                let name_color = if selected == Some(i) { palette.text } else { palette.text_muted };
                 self.draw_text(scene, &label, pad_x, baseline, name_color);
+            }
+
+            // Git-modified "M" badge on the right edge.
+            if row.git_modified {
+                let badge = "M";
+                let badge_w = badge.chars().count() as f64 * self.advance;
+                self.draw_text(scene, badge, area.x1 - badge_w - 8.0 * scale, baseline, palette.accent);
             }
         }
 
@@ -881,6 +913,7 @@ impl TextSystem {
     ///
     /// Called from the render loop *after* `Chrome::paint` so the tab strip
     /// background is already filled; this layer adds the real filename text.
+    #[allow(clippy::too_many_arguments)]
     pub fn paint_tabs(
         &mut self,
         scene: &mut Scene,
@@ -889,6 +922,7 @@ impl TextSystem {
         active: usize,
         palette: &Palette,
         scale: f64,
+        diff_lines: usize,
     ) -> Vec<TabHit> {
         self.ensure_metrics(scale);
         let mut hits = Vec::with_capacity(tabs.len());
@@ -946,12 +980,21 @@ impl TextSystem {
             let close = Rect::new(cx, cy, cx + close_sz, cy + close_sz);
             hits.push(TabHit { body, close });
         }
-        // Right side of tab bar: workspace label in fg_dim.
-        let ws_label = "\u{25CB} WORK";
-        let ws_w = ws_label.chars().count() as f64 * self.advance;
-        let ws_x = area.x1 - ws_w - 12.0 * scale;
-        if ws_x > area.x0 + n * tab_w + 8.0 * scale {
-            self.draw_text(scene, ws_label, ws_x, baseline, palette.fg_dim);
+        // Right side of tab bar: "CHANGES · N LINES  ↺ REPLAY DIFF" when dirty, else "TAB · N".
+        let right_label: String = if diff_lines > 0 {
+            format!("CHANGES \u{00B7} {} LINES  \u{21BA} REPLAY DIFF", diff_lines)
+        } else {
+            format!("TAB \u{00B7} {:02}", tabs.len())
+        };
+        let rl_w = right_label.chars().count() as f64 * self.advance;
+        let rl_x = area.x1 - rl_w - 12.0 * scale;
+        let rl_color = if diff_lines > 0 {
+            with_alpha(MARK_MODIFIED, 0xCC)
+        } else {
+            with_alpha(palette.fg_dim, 0xA0)
+        };
+        if rl_x > area.x0 + n * tab_w + 8.0 * scale {
+            self.draw_text(scene, &right_label, rl_x, baseline, rl_color);
         }
         scene.pop_layer();
         hits
@@ -1524,11 +1567,111 @@ impl TextSystem {
         Some(bar)
     }
 
+    // ── logic panel ──────────────────────────────────────────────────────
+
+    /// Paints the right-side logic panel: FIG header, symbol outline, and
+    /// a mini complexity bar chart.
+    pub fn paint_logic_panel(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &LogicPanelView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        if area.width() < 4.0 {
+            return;
+        }
+        self.ensure_metrics(scale);
+        let pad = 10.0 * scale;
+        let row_h = 20.0 * scale;
+
+        // Header: "FIG. 03 — LOGIC" left, "SCOPE" right.
+        let header_h = 28.0 * scale;
+        let header_baseline = area.y0 + header_h * 0.72;
+        self.draw_text(scene, "FIG. 03 \u{2014} LOGIC", area.x0 + pad, header_baseline, palette.fg_dim);
+        let scope_label = "SCOPE";
+        let scope_w = scope_label.chars().count() as f64 * self.advance;
+        self.draw_text(scene, scope_label, area.x1 - scope_w - pad, header_baseline, with_alpha(palette.fg_dim, 0x70));
+        fill_rect(
+            scene,
+            Rect::new(area.x0, area.y0 + header_h - scale.max(1.0), area.x1, area.y0 + header_h),
+            palette.divider,
+        );
+
+        // Symbol outline rows.
+        let outline_y0 = area.y0 + header_h + 4.0 * scale;
+        let outline_clip = Rect::new(area.x0, outline_y0, area.x1, area.y1 - 60.0 * scale);
+        scene.push_clip_layer(
+            vello::peniko::Fill::NonZero,
+            vello::kurbo::Affine::IDENTITY,
+            &outline_clip,
+        );
+        let mut y = outline_y0;
+        for sym in view.symbols {
+            let baseline = y + row_h * 0.72;
+            if sym.is_current {
+                fill_rect(scene, Rect::new(area.x0, y, area.x1, y + row_h), with_alpha(palette.accent, 0x18));
+            }
+            let color = if sym.is_current { palette.text_muted } else { with_alpha(palette.fg_dim, 0xCC) };
+            let label = if sym.is_current {
+                format!("{} \u{25CF} HERE", sym.label)
+            } else {
+                sym.label.clone()
+            };
+            self.draw_text(scene, &label, area.x0 + pad, baseline, color);
+            y += row_h;
+            if y > area.y1 - 64.0 * scale {
+                break;
+            }
+        }
+        scene.pop_layer();
+
+        // Complexity bars at the bottom.
+        let bars_h = 52.0 * scale;
+        let bars_y = area.y1 - bars_h;
+        fill_rect(scene, Rect::new(area.x0, bars_y, area.x1, bars_y + scale.max(1.0)), palette.divider);
+        self.draw_text(
+            scene,
+            "COMPLEXITY",
+            area.x0 + pad,
+            bars_y + 14.0 * scale,
+            with_alpha(palette.fg_dim, 0x80),
+        );
+
+        let bar_w = (area.width() * 0.5 - pad * 1.5).max(4.0);
+        let bar_h = 10.0 * scale;
+        let bar_y = bars_y + 26.0 * scale;
+        let fn_frac = (view.fn_count as f64 / 20.0_f64).clamp(0.0, 1.0);
+        let diff_frac = (view.diff_lines as f64 / 50.0_f64).clamp(0.0, 1.0);
+
+        let fn_x = area.x0 + pad;
+        fill_rrect(scene, Rect::new(fn_x, bar_y, fn_x + bar_w, bar_y + bar_h), 2.0 * scale, with_alpha(palette.fg_dim, 0x28));
+        if fn_frac > 0.0 {
+            fill_rrect(scene, Rect::new(fn_x, bar_y, fn_x + bar_w * fn_frac, bar_y + bar_h), 2.0 * scale, with_alpha(palette.accent, 0xB0));
+        }
+        self.draw_text(scene, "FN", fn_x, bar_y + bar_h + 9.0 * scale, with_alpha(palette.fg_dim, 0x70));
+
+        let cy_x = fn_x + bar_w + pad;
+        if cy_x + bar_w <= area.x1 - pad * 0.5 {
+            fill_rrect(scene, Rect::new(cy_x, bar_y, cy_x + bar_w, bar_y + bar_h), 2.0 * scale, with_alpha(palette.fg_dim, 0x28));
+            if diff_frac > 0.0 {
+                fill_rrect(scene, Rect::new(cy_x, bar_y, cy_x + bar_w * diff_frac, bar_y + bar_h), 2.0 * scale, with_alpha(palette.accent, 0x70));
+            }
+            let cy_label = "CYCLOMATIC";
+            let cy_w = cy_label.chars().count() as f64 * self.advance;
+            self.draw_text(scene, cy_label, (cy_x + bar_w - cy_w).max(cy_x), bar_y + bar_h + 9.0 * scale, with_alpha(palette.fg_dim, 0x70));
+        }
+    }
+
     // ── activity bar ──────────────────────────────────────────────────────
 
-    /// Paints the section labels (EDITOR / SEARCH / TERM / GIT) into the top
-    /// 32px zone of the title-bar rect.  The active section gets a 2px accent
-    /// bottom border; inactive ones are shown in `fg_dim`.
+    /// Paints the section tabs into the top 32px activity-bar zone.
+    ///
+    /// Layout (left → right):
+    /// - "EDEN" brand in accent colour
+    /// - Numbered section tabs: "01 EDITOR ★", "02 SEARCH", etc.
+    /// - Right side: "⌘P · PALETTE" before the 80px window-button zone
     pub fn paint_activity_bar(
         &mut self,
         scene: &mut Scene,
@@ -1540,40 +1683,61 @@ impl TextSystem {
         self.ensure_metrics(scale);
         let activity_h = 32.0 * scale;
         let bar = Rect::new(area.x0, area.y0, area.x1, area.y0 + activity_h);
-        // Vertically centre text within the 32px band.
         let baseline = bar.y0 + (activity_h + self.font_size_px * 0.72) * 0.5;
-        // Leave 120px on the right for the window control circles.
-        let avail_x1 = bar.x1 - 120.0 * scale;
+        // Reserve space for window control buttons on the right.
+        let win_btn_zone = 80.0 * scale;
+        let avail_x1 = bar.x1 - win_btn_zone;
         let pad = 14.0 * scale;
-        let gap = 20.0 * scale;
-        let sections: &[&str] = &["EDITOR", "SEARCH", "TERM", "GIT"];
-        let mut x = bar.x0 + pad;
-        for &label in sections {
-            let lw = label.chars().count() as f64 * self.advance;
-            if x + lw > avail_x1 {
+        let gap = 18.0 * scale;
+
+        // "EDEN" brand in accent colour.
+        let brand = "EDEN";
+        let brand_w = brand.chars().count() as f64 * self.advance;
+        self.draw_text(scene, brand, bar.x0 + pad, baseline, palette.accent);
+        let mut x = bar.x0 + pad + brand_w + gap * 1.5;
+
+        // Numbered section tabs. The matching section gets a ★ suffix and 2px accent underline.
+        let sections: &[(&str, &str)] = &[
+            ("01", "EDITOR"),
+            ("02", "SEARCH"),
+            ("03", "TERM"),
+            ("04", "GIT"),
+        ];
+        for &(num, label) in sections {
+            let is_active = label == view.active;
+            let full_label = if is_active {
+                format!("{num} {label} \u{2605}")
+            } else {
+                format!("{num} {label}")
+            };
+            let lw = full_label.chars().count() as f64 * self.advance;
+            if x + lw > avail_x1 - 100.0 * scale {
                 break;
             }
-            let is_active = label == view.active;
             let color = if is_active { palette.text } else { palette.fg_dim };
-            self.draw_text(scene, label, x, baseline, color);
+            self.draw_text(scene, &full_label, x, baseline, color);
             if is_active {
                 let uh = 2.0 * scale;
-                fill_rect(
-                    scene,
-                    Rect::new(x, bar.y1 - uh, x + lw, bar.y1),
-                    palette.accent,
-                );
+                fill_rect(scene, Rect::new(x, bar.y1 - uh, x + lw, bar.y1), palette.accent);
             }
             x += lw + gap;
+        }
+
+        // Right side: "⌘P · PALETTE" palette shortcut.
+        let cmd_label = "\u{2318}P \u{00B7} PALETTE";
+        let cmd_w = cmd_label.chars().count() as f64 * self.advance;
+        let cmd_x = avail_x1 - cmd_w - pad;
+        if cmd_x > x {
+            self.draw_text(scene, cmd_label, cmd_x, baseline, with_alpha(palette.fg_dim, 0xA0));
         }
     }
 
     // ── breadcrumb bar ────────────────────────────────────────────────────
 
     /// Paints the breadcrumb zone (bottom 36px of the title-bar rect).
-    /// Left side: "EDEN V0.1.0" label.  Right side: path segments like
-    /// `crates / eden-app / src / main.rs` (filename in `text_muted`, parents
-    /// in `fg_dim`).
+    ///
+    /// Layout: "EDEN V0.1.0 · A" brand on left, file breadcrumb path in the
+    /// centre, then "◇ WORK" and "€ {theme}" buttons on the right.
     pub fn paint_breadcrumb(
         &mut self,
         scene: &mut Scene,
@@ -1588,11 +1752,23 @@ impl TextSystem {
         let baseline = bar.y0 + (bar.height() + self.font_size_px * 0.72) * 0.5;
         let pad = 14.0 * scale;
 
-        // Left: "EDEN V0.1.0" brand label.
-        let brand = "EDEN V0.1.0";
+        // Left: "EDEN V0.1.0 · A" brand label.
+        let brand = "EDEN V0.1.0 \u{00B7} A";
+        let brand_w = brand.chars().count() as f64 * self.advance;
         self.draw_text(scene, brand, bar.x0 + pad, baseline, palette.fg_dim);
 
-        // Right: path segments.
+        // Right buttons: "◇ WORK" and "€ {THEME}" separated by a gap.
+        let work_label = "\u{25C7} WORK";
+        let theme_label = format!("\u{20AC} {}", view.theme_name.to_uppercase());
+        let work_w = work_label.chars().count() as f64 * self.advance;
+        let theme_w = theme_label.chars().count() as f64 * self.advance;
+        let btn_gap = 14.0 * scale;
+        let theme_x = bar.x1 - pad - theme_w;
+        let work_x = theme_x - btn_gap - work_w;
+        self.draw_text(scene, work_label, work_x, baseline, with_alpha(palette.fg_dim, 0xA0));
+        self.draw_text(scene, &theme_label, theme_x, baseline, with_alpha(palette.fg_dim, 0xA0));
+
+        // Centre: file breadcrumb path (between brand end and right buttons).
         if let Some(path) = view.path {
             let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
             if segs.is_empty() {
@@ -1600,11 +1776,12 @@ impl TextSystem {
             }
             let sep = " / ";
             let sep_w = sep.chars().count() as f64 * self.advance;
-            // Build total width to right-align.
             let total_w: f64 = segs.iter().map(|s| s.chars().count() as f64 * self.advance).sum::<f64>()
                 + sep_w * (segs.len().saturating_sub(1)) as f64;
-            let brand_end = bar.x0 + pad + brand.chars().count() as f64 * self.advance + 16.0 * scale;
-            let start_x = (bar.x1 - total_w - pad).max(brand_end);
+            let centre_zone_x0 = bar.x0 + pad + brand_w + 16.0 * scale;
+            let centre_zone_x1 = work_x - 16.0 * scale;
+            // Right-align the path within the centre zone, clamped to the left edge.
+            let start_x = (centre_zone_x1 - total_w).max(centre_zone_x0);
             let mut cx = start_x;
             for (i, seg) in segs.iter().enumerate() {
                 if i > 0 {
@@ -1621,6 +1798,8 @@ impl TextSystem {
     // ── status bar ────────────────────────────────────────────────────────
 
     /// Paints the instrument-panel status bar into `area`.
+    ///
+    /// Layout: "● LSP · STATUS" left | position/file/encoding centre | diag+git right
     pub fn paint_status_bar(
         &mut self,
         scene: &mut Scene,
@@ -1632,54 +1811,79 @@ impl TextSystem {
         self.ensure_metrics(scale);
         let baseline = area.y0 + (area.height() + self.font_size_px * 0.72) * 0.5;
         let muted = with_alpha(palette.text_muted, 0xCC);
+        let dim = with_alpha(palette.fg_dim, 0xCC);
+        let sep = " \u{00B7} ";
+        let sep_adv = sep.chars().count() as f64 * self.advance;
 
-        // design: status bar as instrument panel — left | centre | right sections.
-
-        // ── Left section: "● BRANCH  {branch}" ──────────────────────────────
+        // ── Left: "● RUST-ANALYZER · IDLE" ──────────────────────────────────
         let mut x = area.x0 + 8.0 * scale;
-        let dot_str = "\u{25CF} ";
-        self.draw_text(scene, dot_str, x, baseline, palette.fg_dim);
-        x += dot_str.chars().count() as f64 * self.advance;
-        let branch_name = view.branch.unwrap_or("—");
-        self.draw_text(scene, branch_name, x, baseline, muted);
+        let lsp_dot = "\u{25CF} ";
+        let lsp_status = if view.lsp_idle { "IDLE" } else { "BUSY" };
+        let lang_upper = view.language.unwrap_or("PLAIN").to_uppercase();
+        let lsp_name = format!("{}-ANALYZER", lang_upper);
+        self.draw_text(scene, lsp_dot, x, baseline, palette.accent);
+        x += lsp_dot.chars().count() as f64 * self.advance;
+        self.draw_text(scene, &lsp_name, x, baseline, muted);
+        x += lsp_name.chars().count() as f64 * self.advance;
+        self.draw_text(scene, sep, x, baseline, dim);
+        x += sep_adv;
+        self.draw_text(scene, lsp_status, x, baseline, dim);
+        let left_end = x + lsp_status.chars().count() as f64 * self.advance;
 
-        // ── Right section: errors · warnings (right-aligned) ─────────────────
+        // ── Right: "N ERR · N WARN · AUTOSAVED Xs · GIT: branch ↑N" ─────────
         let (errors, warnings) = view.diagnostics;
-        let warn_color = if warnings > 0 { Rgba8::rgb(0xC8, 0xA8, 0x40) } else { palette.fg_dim };
-        let err_color = if errors > 0 { palette.accent } else { palette.fg_dim };
-        let warn_txt = format!("{warnings} WARN");
-        let err_txt = format!("{errors} ERR");
-        let sep_txt = " \u{00B7} ";
-        // "AUTOSAVED" transient message replaces the normal right segment when set.
-        let right_text = if let Some(msg) = view.message {
-            msg.to_owned()
-        } else {
-            format!("{err_txt}{sep_txt}{warn_txt}")
-        };
-        let right_w = right_text.chars().count() as f64 * self.advance;
-        let right_x = area.x1 - right_w - 12.0 * scale;
-        if view.message.is_some() {
-            self.draw_text(scene, &right_text, right_x, baseline, palette.accent);
-        } else {
-            // Draw err and warn segments with their respective colours.
-            self.draw_text(scene, &err_txt, right_x, baseline, err_color);
-            let sep_x = right_x + err_txt.chars().count() as f64 * self.advance;
-            self.draw_text(scene, sep_txt, sep_x, baseline, palette.fg_dim);
-            let warn_x = sep_x + sep_txt.chars().count() as f64 * self.advance;
-            self.draw_text(scene, &warn_txt, warn_x, baseline, warn_color);
-        }
+        let warn_color = if warnings > 0 { Rgba8::rgb(0xC8, 0xA8, 0x40) } else { dim };
+        let err_color = if errors > 0 { palette.accent } else { dim };
 
-        // ── Centre section: language · position · encoding ───────────────────
-        let lang = view.language.unwrap_or("PLAIN");
-        let pos_text = format!(
-            "{} \u{00B7} LN {} \u{00B7} COL {}     UTF-8 \u{00B7} LF",
-            lang.to_uppercase(),
-            view.line,
-            view.col
+        // Build right string pieces (right-to-left order for positioning).
+        let mut right_parts: Vec<(String, Rgba8)> = Vec::new();
+        // GIT: branch ↑N
+        if let Some(branch) = view.branch {
+            let ahead_str = if view.git_ahead > 0 {
+                format!("GIT: {} \u{2191}{}", branch.to_uppercase(), view.git_ahead)
+            } else {
+                format!("GIT: {}", branch.to_uppercase())
+            };
+            right_parts.push((ahead_str, dim));
+            right_parts.push((sep.to_owned(), dim));
+        }
+        // AUTOSAVED Xs
+        if let Some(secs) = view.autosaved_ago {
+            let auto_txt = if let Some(msg) = view.message {
+                msg.to_owned()
+            } else {
+                format!("AUTOSAVED {secs}S")
+            };
+            let auto_color = if view.message.is_some() { palette.accent } else { dim };
+            right_parts.push((auto_txt, auto_color));
+            right_parts.push((sep.to_owned(), dim));
+        }
+        // N WARN
+        right_parts.push((format!("{warnings} WARN"), warn_color));
+        right_parts.push((sep.to_owned(), dim));
+        // N ERR
+        right_parts.push((format!("{errors} ERR"), err_color));
+
+        // Measure total right width (reversed order = rightmost first).
+        let total_right_w: f64 = right_parts.iter().map(|(s, _)| s.chars().count() as f64 * self.advance).sum();
+        let right_pad = 12.0 * scale;
+        let mut rx = area.x1 - total_right_w - right_pad;
+        for (txt, color) in right_parts.iter().rev() {
+            self.draw_text(scene, txt, rx, baseline, *color);
+            rx += txt.chars().count() as f64 * self.advance;
+        }
+        let right_start = area.x1 - total_right_w - right_pad;
+
+        // ── Centre: "FILE.RS · LN N · COL N · UTF-8 · LF · CARGO N.NN" ──────
+        let file_name = view.file_name.unwrap_or("—").to_uppercase();
+        let cargo_str = view.cargo_version.map_or_else(String::new, |v| format!("{sep}CARGO {v}"));
+        let centre_text = format!(
+            "{} \u{00B7} LN {} \u{00B7} COL {} \u{00B7} UTF-8 \u{00B7} LF{}",
+            file_name, view.line, view.col, cargo_str
         );
-        let centre_w = pos_text.chars().count() as f64 * self.advance;
-        let centre_x = ((area.x0 + area.x1) - centre_w) * 0.5;
-        self.draw_text(scene, &pos_text, centre_x.max(x + 16.0 * scale), baseline, muted);
+        let centre_w = centre_text.chars().count() as f64 * self.advance;
+        let centre_x = ((left_end + right_start) - centre_w) * 0.5;
+        self.draw_text(scene, &centre_text, centre_x.max(left_end + 16.0 * scale), baseline, muted);
     }
 
     // ── find / replace bar ────────────────────────────────────────────────
@@ -2174,6 +2378,8 @@ pub struct SettingsView<'a> {
 pub struct ActivityBarView<'a> {
     /// The currently active section label: `"EDITOR"`, `"SEARCH"`, `"TERM"`, `"GIT"`.
     pub active: &'a str,
+    /// Name of the currently active theme (shown as a badge on the right).
+    pub theme_name: &'a str,
 }
 
 // ── breadcrumb bar ─────────────────────────────────────────────────────────────
@@ -2182,6 +2388,8 @@ pub struct ActivityBarView<'a> {
 pub struct BreadcrumbView<'a> {
     /// Current file path (relative, forward-slash separated), or `None`.
     pub path: Option<&'a str>,
+    /// Name of the active theme for the right-side theme badge.
+    pub theme_name: &'a str,
 }
 
 // ── status bar ────────────────────────────────────────────────────────────────
@@ -2190,7 +2398,7 @@ pub struct BreadcrumbView<'a> {
 pub struct StatusBarView<'a> {
     /// Git branch name, or `None` if not in a repo.
     pub branch: Option<&'a str>,
-    /// Language mode for the active file (e.g. `"Rust"`), or `None`.
+    /// Language mode for the active file (e.g. `"RUST"`), or `None`.
     pub language: Option<&'a str>,
     /// 1-based line number of the primary caret.
     pub line: usize,
@@ -2200,6 +2408,38 @@ pub struct StatusBarView<'a> {
     pub diagnostics: (usize, usize),
     /// A transient message (save confirmation, etc.), centred when present.
     pub message: Option<&'a str>,
+    /// Base filename of the active file (e.g. `"MAIN.RS"`), or `None`.
+    pub file_name: Option<&'a str>,
+    /// Whether the LSP is currently idle (vs processing).
+    pub lsp_idle: bool,
+    /// Cargo/toolchain version string (e.g. `"1.78"`), or `None`.
+    pub cargo_version: Option<&'a str>,
+    /// Seconds elapsed since the last autosave, or `None` if not yet saved.
+    pub autosaved_ago: Option<u32>,
+    /// Number of local commits ahead of the upstream branch.
+    pub git_ahead: u32,
+}
+
+// ── logic panel ───────────────────────────────────────────────────────────────
+
+/// One symbol entry in the logic panel outline.
+pub struct LogicSymbol {
+    /// Rendered label, e.g. `"| struct Aperture"` or `"  ↳ acquire"`.
+    pub label: String,
+    /// Nesting depth (0 = top-level, 1 = method, 2 = nested block).
+    pub depth: usize,
+    /// Whether the primary caret is inside this symbol's span.
+    pub is_current: bool,
+}
+
+/// Everything needed to render the right-side logic panel.
+pub struct LogicPanelView<'a> {
+    /// Ordered list of visible symbols.
+    pub symbols: &'a [LogicSymbol],
+    /// Number of changed lines in the active diff (for complexity bar label).
+    pub diff_lines: usize,
+    /// Total function count in the file (cyclomatic bar denominator).
+    pub fn_count: usize,
 }
 
 // ── scrubber ──────────────────────────────────────────────────────────────────

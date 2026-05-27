@@ -27,9 +27,9 @@ use eden_theme::Rgba8;
 use eden_ui::{
     ActivityBarView, BreadcrumbView, Chrome, CmdEntry, CmdPaletteView, CompletionEntry,
     CompletionView, DiffMark, Editor, EditorFrame, FindBarHits, FindBarView, GutterMark,
-    Highlighter, Highlights, MenuItemView, MinimapView, PaletteView, SearchPanelView,
-    SearchRowView, ScrubberView, SettingsToggle, SettingsView, StatusBarView, TabHit, TabLabel,
-    TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
+    Highlighter, Highlights, LogicPanelView, LogicSymbol, MenuItemView, MinimapView,
+    PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle, SettingsView,
+    StatusBarView, TabHit, TabLabel, TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -132,6 +132,110 @@ fn language_for_path(path: &std::path::Path) -> Option<&'static str> {
         "rs" => Some("rust"),
         _ => None,
     }
+}
+
+/// Scans the editor buffer for top-level Rust symbols (use blocks, structs,
+/// impls, functions) and returns them as a flat list for the logic panel.
+fn derive_logic_symbols(editor: &Editor, current_line: usize) -> Vec<LogicSymbol> {
+    let buf = editor.buffer();
+    let total = buf.len_lines();
+    let mut symbols: Vec<LogicSymbol> = Vec::new();
+    let mut use_count = 0usize;
+    let mut use_start = 0usize;
+    let mut in_impl = false;
+    let mut impl_end_depth = 0i32;
+    let mut brace_depth = 0i32;
+
+    for i in 0..total {
+        let start = buf.line_to_char(i);
+        let end = buf.line_end(i);
+        let line = buf.slice_to_string(start..end);
+        let t = line.trim();
+
+        for ch in t.chars() {
+            if ch == '{' { brace_depth += 1; }
+            if ch == '}' { brace_depth -= 1; if brace_depth < 0 { brace_depth = 0; } }
+        }
+        if brace_depth == 0 { in_impl = false; }
+
+        if t.starts_with("use ") || t.starts_with("pub use ") {
+            if use_count == 0 { use_start = i; }
+            use_count += 1;
+            continue;
+        }
+        if use_count > 0 {
+            let span_contains = current_line >= use_start && current_line < i;
+            symbols.push(LogicSymbol {
+                label: format!("| use \u{00D7}{use_count}"),
+                depth: 0,
+                is_current: span_contains,
+            });
+            use_count = 0;
+        }
+
+        let is_struct = t.starts_with("pub struct ") || t.starts_with("struct ")
+            || t.starts_with("pub enum ") || t.starts_with("enum ")
+            || t.starts_with("pub trait ") || t.starts_with("trait ");
+        if is_struct {
+            let name = t.splitn(3, ' ').nth(if t.starts_with("pub ") { 2 } else { 1 }).unwrap_or("?")
+                .split_once(|c: char| !c.is_alphanumeric() && c != '_').map_or_else(
+                    || t.split_whitespace().nth(if t.starts_with("pub ") { 2 } else { 1 }).unwrap_or("?"),
+                    |(n, _)| n,
+                );
+            let kind = if t.contains("struct") { "struct" } else if t.contains("enum") { "enum" } else { "trait" };
+            symbols.push(LogicSymbol {
+                label: format!("| {kind} {name}"),
+                depth: 0,
+                is_current: current_line == i,
+            });
+            in_impl = false;
+        }
+
+        let is_impl = (t.starts_with("impl ") || t.starts_with("pub impl ")) && t.contains('{');
+        if is_impl {
+            let after = if t.starts_with("pub impl") { &t[9..] } else { &t[5..] };
+            let name = after.split_once(['<', '{', ' ']).map_or(after, |(n, _)| n).trim();
+            symbols.push(LogicSymbol {
+                label: format!("| impl {name}"),
+                depth: 0,
+                is_current: current_line == i,
+            });
+            in_impl = true;
+            impl_end_depth = brace_depth;
+        }
+
+        let is_fn = in_impl && (t.starts_with("pub fn ") || t.starts_with("fn ")
+            || t.starts_with("pub async fn ") || t.starts_with("async fn "));
+        if is_fn {
+            let after = if t.starts_with("pub async fn") { &t[13..] }
+                        else if t.starts_with("async fn") { &t[9..] }
+                        else if t.starts_with("pub fn") { &t[7..] }
+                        else { &t[3..] };
+            let fn_name = after.split_once('(').map_or(after.trim(), |(n, _)| n.trim());
+            symbols.push(LogicSymbol {
+                label: format!("  \u{21B3} {fn_name}"),
+                depth: 1,
+                is_current: current_line == i,
+            });
+            let _ = impl_end_depth;
+        }
+    }
+    // Flush any trailing use block.
+    if use_count > 0 {
+        let span_contains = current_line >= use_start;
+        symbols.push(LogicSymbol {
+            label: format!("| use \u{00D7}{use_count}"),
+            depth: 0,
+            is_current: span_contains,
+        });
+    }
+
+    // If no symbol is marked current, mark the nearest one.
+    if !symbols.iter().any(|s| s.is_current) && !symbols.is_empty() {
+        let n = symbols.len();
+        symbols[n.saturating_sub(1)].is_current = true;
+    }
+    symbols
 }
 
 /// The line-comment token for a file's language (Ctrl+/). Defaults to `"// "`.
@@ -661,6 +765,10 @@ struct App {
     window_btn_hover: Option<WinBtn>,
     /// Whether the window is currently maximized.
     window_maximized: bool,
+    /// Set of file paths with uncommitted git changes (refreshed with diff marks).
+    modified_files: std::collections::HashSet<PathBuf>,
+    /// Timestamp of the last completed autosave.
+    last_autosave_time: Option<Instant>,
 
     // Find / replace (Ctrl+F / Ctrl+H) and go-to-line (Ctrl+G).
     find_open: bool,
@@ -763,6 +871,8 @@ impl App {
             pending_quit: false,
             window_btn_hover: None,
             window_maximized: false,
+            modified_files: std::collections::HashSet::new(),
+            last_autosave_time: None,
             find_open: false,
             find: FindState::default(),
             find_hits: None,
@@ -866,20 +976,26 @@ impl App {
     // ── window control buttons ────────────────────────────────────────────
 
     /// Returns which window button (if any) a physical-pixel point hits.
+    ///
+    /// Hit areas are tight rectangles (20×20 logical px) centered on each
+    /// button circle to avoid false positives on adjacent chrome.
     fn hit_window_btn(&self, p: Point) -> Option<WinBtn> {
         let Some(chrome) = &self.chrome else { return None };
         let tb = chrome.title_bar_rect();
         if tb.height() < 2.0 {
             return None;
         }
-        // Buttons are in the top 32px of the title bar (the activity bar zone).
-        let btn_y0 = tb.y0;
-        let btn_y1 = tb.y0 + 32.0 * self.scale;
-        let x1 = tb.x1;
         let s = self.scale;
-        let close = Rect::new(x1 - 40.0 * s, btn_y0, x1, btn_y1);
-        let maximize = Rect::new(x1 - 80.0 * s, btn_y0, x1 - 40.0 * s, btn_y1);
-        let minimize = Rect::new(x1 - 120.0 * s, btn_y0, x1 - 80.0 * s, btn_y1);
+        let x1 = tb.x1;
+        // Button circle centres (matching panels.rs paint positions).
+        let cy = tb.y0 + 16.0 * s;
+        let close_cx = x1 - 16.0 * s;
+        let max_cx = x1 - 36.0 * s;
+        let min_cx = x1 - 56.0 * s;
+        let hr = 10.0 * s; // hit half-size
+        let close = Rect::new(close_cx - hr, cy - hr, close_cx + hr, cy + hr);
+        let maximize = Rect::new(max_cx - hr, cy - hr, max_cx + hr, cy + hr);
+        let minimize = Rect::new(min_cx - hr, cy - hr, min_cx + hr, cy + hr);
         if close.contains(p) {
             return Some(WinBtn::Close);
         }
@@ -896,10 +1012,10 @@ impl App {
     fn is_title_drag_zone(&self, p: Point) -> bool {
         let Some(chrome) = &self.chrome else { return false };
         let tb = chrome.title_bar_rect();
-        // Drag zone: the activity bar area EXCLUDING the button zone.
-        let btn_zone_start = tb.x1 - 120.0 * self.scale;
-        let drag_rect =
-            Rect::new(tb.x0, tb.y0, btn_zone_start, tb.y0 + 32.0 * self.scale);
+        let s = self.scale;
+        // Drag zone: the activity bar area EXCLUDING the button zone (from min_cx leftward).
+        let btn_zone_start = tb.x1 - 66.0 * s; // min_cx - hr = x1-56-10
+        let drag_rect = Rect::new(tb.x0, tb.y0, btn_zone_start, tb.y0 + 32.0 * s);
         drag_rect.contains(p)
     }
 
@@ -1773,6 +1889,7 @@ impl App {
             match std::fs::write(&path, &contents) {
                 Ok(()) => {
                     self.modified = false;
+                    self.last_autosave_time = Some(Instant::now());
                     self.refresh_diff_marks();
                     self.toast("AUTOSAVED");
                     tracing::debug!(file = %path.display(), "autosaved");
@@ -2470,6 +2587,15 @@ impl App {
             }
             Err(err) => tracing::debug!("diff_hunks: {err:#}"),
         }
+        // Also refresh the set of all modified files for sidebar M badges.
+        if let Ok(statuses) = git.file_statuses() {
+            let root = git.root().to_path_buf();
+            self.modified_files = statuses
+                .into_iter()
+                .filter(|s| s.state.unstaged || s.state.staged)
+                .map(|s| root.join(&s.path))
+                .collect();
+        }
     }
 
     // ── LSP helpers ───────────────────────────────────────────────────────
@@ -2554,12 +2680,18 @@ impl App {
         if rect.width() < 2.0 || !rect.contains(point) {
             return None;
         }
-        let row_h = text.sidebar_row_height();
-        let idx = ((point.y - rect.y0 + self.tree_scroll) / row_h).floor();
-        if idx < 0.0 {
+        // Account for the 28px FIG header and the 28px branch footer.
+        let header_h = 28.0 * self.scale;
+        let footer_h = 28.0 * self.scale;
+        if point.y < rect.y0 + header_h || point.y > rect.y1 - footer_h {
             return None;
         }
-        let idx = idx as usize;
+        let row_h = text.sidebar_row_height();
+        let rel_y = point.y - rect.y0 - header_h + self.tree_scroll;
+        if rel_y < 0.0 {
+            return None;
+        }
+        let idx = (rel_y / row_h).floor() as usize;
         (idx < self.tree.entries().len()).then_some(idx)
     }
 
@@ -2909,31 +3041,36 @@ impl App {
         //         text.paint_menu_bar(&mut self.scene, area, &MENU_BAR, self.menu_bar_open, &palette, self.scale);
         // }
 
-        // Window control button hover glow.
+        // Window control button hover glow — tight circle around each button.
         if let Some(chrome) = &self.chrome {
             let tb = chrome.title_bar_rect();
             let s = self.scale;
             let x1 = tb.x1;
-            let btn_y0 = tb.y0;
-            let btn_y1 = tb.y0 + 32.0 * s;
+            let cy = tb.y0 + 16.0 * s;
+            let r = 9.0 * s;
             let btns = [
-                (WinBtn::Close,    Rect::new(x1 - 40.0 * s, btn_y0, x1,               btn_y1)),
-                (WinBtn::Maximize, Rect::new(x1 - 80.0 * s, btn_y0, x1 - 40.0 * s,   btn_y1)),
-                (WinBtn::Minimize, Rect::new(x1 - 120.0 * s, btn_y0, x1 - 80.0 * s,  btn_y1)),
+                (WinBtn::Close,    Point::new(x1 - 16.0 * s, cy)),
+                (WinBtn::Maximize, Point::new(x1 - 36.0 * s, cy)),
+                (WinBtn::Minimize, Point::new(x1 - 56.0 * s, cy)),
             ];
-            for (btn, rect) in &btns {
+            for (btn, center) in &btns {
                 if self.window_btn_hover == Some(*btn) {
                     let hover_color = if *btn == WinBtn::Close {
-                        eden_theme::Rgba8::rgba(0xE8, 0x34, 0x1C, 0x30)
+                        eden_theme::Rgba8::rgba(0xE8, 0x34, 0x1C, 0x50)
                     } else {
-                        eden_theme::Rgba8::rgba(0xFF, 0xFF, 0xFF, 0x12)
+                        eden_theme::Rgba8::rgba(0xFF, 0xFF, 0xFF, 0x20)
                     };
-                    fill_rrect(&mut self.scene, *rect, 0.0, hover_color);
+                    fill_rrect(
+                        &mut self.scene,
+                        Rect::new(center.x - r, center.y - r, center.x + r, center.y + r),
+                        r,
+                        hover_color,
+                    );
                 }
             }
         }
 
-        // Activity bar labels (EDITOR / SEARCH / TERM / GIT).
+        // Activity bar (top 32px): EDEN brand + numbered section tabs + ⌘P·PALETTE.
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let area = chrome.title_bar_rect();
             let palette = chrome.palette();
@@ -2947,7 +3084,10 @@ impl App {
             text.paint_activity_bar(
                 &mut self.scene,
                 area,
-                &ActivityBarView { active: active_section },
+                &ActivityBarView {
+                    active: active_section,
+                    theme_name: chrome.active_theme_name(),
+                },
                 &palette,
                 self.scale,
             );
@@ -2965,7 +3105,10 @@ impl App {
             text.paint_breadcrumb(
                 &mut self.scene,
                 area,
-                &BreadcrumbView { path: rel_path.as_deref() },
+                &BreadcrumbView {
+                    path: rel_path.as_deref(),
+                    theme_name: chrome.active_theme_name(),
+                },
                 &palette,
                 self.scale,
             );
@@ -2995,7 +3138,7 @@ impl App {
             let tab_rect = chrome.tab_strip_rect();
             let palette = chrome.palette();
             self.tab_hits =
-                text.paint_tabs(&mut self.scene, tab_rect, &labels, active_idx, &palette, self.scale);
+                text.paint_tabs(&mut self.scene, tab_rect, &labels, active_idx, &palette, self.scale, diff_marks.len());
         }
 
         // Status bar: real branch, language, and cursor position text.
@@ -3021,6 +3164,10 @@ impl App {
             let line = self.editor.buffer().char_to_line(caret.head) + 1;
             let line_start = self.editor.buffer().line_to_char(line.saturating_sub(1));
             let col = caret.head.saturating_sub(line_start) + 1;
+            let file_name = self.current_path.as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_uppercase());
+            let autosaved_ago = self.last_autosave_time.map(|t| t.elapsed().as_secs() as u32);
             text.paint_status_bar(
                 &mut self.scene,
                 status_rect,
@@ -3031,6 +3178,11 @@ impl App {
                     col,
                     diagnostics: diag_counts,
                     message: toast_msg.as_deref(),
+                    file_name: file_name.as_deref(),
+                    lsp_idle: true,
+                    cargo_version: Some("1.78"),
+                    autosaved_ago,
+                    git_ahead: self.git.as_ref().map(|g| g.commits_ahead()).unwrap_or(0),
                 },
                 &palette,
                 self.scale,
@@ -3091,8 +3243,11 @@ impl App {
                             depth: e.depth,
                             is_dir: e.is_dir,
                             expanded: e.expanded,
+                            git_modified: self.modified_files.contains(&e.path),
                         })
                         .collect();
+                    let branch = self.git.as_ref().and_then(|g| g.branch_name());
+                    let total_files = self.files.len();
                     self.tree_scroll = text.paint_file_tree(
                         &mut self.scene,
                         rect,
@@ -3101,6 +3256,8 @@ impl App {
                             scroll_px: self.tree_scroll,
                             hovered: self.tree_hover,
                             selected: selected_row,
+                            branch: branch.as_deref(),
+                            total_files,
                         },
                         &palette,
                         self.scale,
@@ -3137,6 +3294,26 @@ impl App {
                     find_current: if self.find_open { self.find.current } else { None },
                 },
             );
+        }
+
+        // Logic panel symbol outline (right panel).
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let logic_rect = chrome.logic_panel_rect();
+            if logic_rect.width() > 4.0 {
+                let palette = chrome.palette();
+                let caret = self.editor.primary();
+                let current_line = self.editor.buffer().char_to_line(caret.head);
+                let symbols = derive_logic_symbols(&self.editor, current_line);
+                let diff_lines = self.diff_marks.len();
+                let fn_count = symbols.iter().filter(|s| s.depth == 1).count();
+                text.paint_logic_panel(
+                    &mut self.scene,
+                    logic_rect,
+                    &LogicPanelView { symbols: &symbols, diff_lines, fn_count },
+                    &palette,
+                    self.scale,
+                );
+            }
         }
 
         // Phase 6 — Semantic Minimap (painted over the editor right edge).
