@@ -58,25 +58,25 @@ themes/
 
 - **Window & GPU**: winit 0.30 + wgpu/vello, DX12, vsync, HiDPI-aware.
 - **Chrome**: title bar / sidebar / tab strip / editor canvas / status bar, taffy flex layout, spring-animated sidebar toggle (`Ctrl+B`), spring theme crossfade (`Ctrl+T`), hover glow.
-- **3 Themes**: Eden Day (warm paper), Eden Dusk (navy), Eden Noir (near-black gold). TOML-serialisable, hot-crossfade capable.
+- **5 Themes**: Brutal Dark, Eden Day, Eden Dusk, Eden Noir, Eden Nothing. TOML-serialisable, hot-crossfade (`Ctrl+T`). Theme badge in breadcrumb bar is clickable to cycle themes.
 - **Editor buffer**: ropey rope, 50 MB capable. Typing, backspace, delete-forward, Home/End, arrows (+ Shift extend), Ctrl+A, Ctrl+Z/Ctrl+Y undo/redo with coalescing, multi-cursor `add_caret`/`select_all`.
 - **Text rendering**: cosmic-text shaping + vello GPU rasterisation. Gutter line numbers, selection highlights, carets (hidden when unfocused), spring-driven scroll with caret-follow and page-scroll.
-- **Syntax highlighting**: tree-sitter-rust, 15 HighlightKinds → theme Syntax colours. Full reparse on change (incremental `InputEdit` is a noted follow-up).
-- **File tree**: gitignore-aware lazy expand/collapse via `eden-workspace::FileTree`. Click to open files, hover highlight, scroll.
+- **Syntax highlighting**: tree-sitter for 11 languages: Rust, JavaScript, TypeScript, TSX, Python, Go, C, JSON, Bash, HTML, CSS. 15 HighlightKinds → theme Syntax colours. `Highlighter::for_language(lang)` dispatch.
+- **Menu bar**: File / Edit / View / Go / Run / Terminal / Help in the breadcrumb bar. All dropdowns fully implemented with keyboard shortcuts. Clicking a label opens the dropdown.
+- **File tree**: gitignore-aware lazy expand/collapse via `eden-workspace::FileTree`. Click to open files, hover highlight, scroll. Explorer header, ⎇ branch footer.
 - **Cmd-P**: nucleo fuzzy file finder over gitignore-filtered project files, keyboard navigation, Enter opens into editor.
 
 ---
 
 ## Known Gaps / Technical Debt
 
-- **Syntax only Rust**: `Highlighter::rust()` is the only language wired. `open_path` does not detect language and does not re-init the highlighter — other files open without highlights.
 - **Cursor doesn't pulse**: spec §7.6 says sine-wave pulse (~1.1 s period). Currently just a solid static caret.
 - **Cmd-click multi-cursor not wired**: `Editor::add_caret` exists but `MouseButton::Left` handler in `main.rs` only routes to the file tree, not the text canvas.
 - **No horizontal scroll**: text overflows the right edge silently.
 - **No soft-wrap**: lines render as logical lines; very long lines run off screen.
 - **OS reduce-motion not detected**: `MotionPrefs::from_env()` reads `EDEN_REDUCE_MOTION=1`; Windows API hook is a noted future item.
 - **Font**: Consolas stand-in. JetBrains Mono (§6) requires bundling the font file in `assets/fonts/`.
-- **No `CLAUDE.md` referenced by spec §10**: this file.
+- **Activity bar section tabs not clickable**: "Editor / Search / Term / Git" indicator in activity bar is visual-only; switching panels must be done by keyboard (Ctrl+B, Ctrl+Shift+F, etc.).
 - **No `README.md` yet**.
 
 ---

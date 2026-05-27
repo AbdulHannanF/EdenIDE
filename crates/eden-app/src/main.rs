@@ -130,6 +130,16 @@ fn language_for_path(path: &std::path::Path) -> Option<&'static str> {
     let ext = path.extension().and_then(|e| e.to_str())?.to_lowercase();
     match ext.as_str() {
         "rs" => Some("rust"),
+        "js" | "mjs" | "cjs" => Some("javascript"),
+        "ts" | "mts" | "cts" => Some("typescript"),
+        "tsx" => Some("tsx"),
+        "py" | "pyi" => Some("python"),
+        "go" => Some("go"),
+        "c" | "h" => Some("c"),
+        "json" | "jsonc" => Some("json"),
+        "sh" | "bash" | "zsh" => Some("bash"),
+        "html" | "htm" => Some("html"),
+        "css" => Some("css"),
         _ => None,
     }
 }
@@ -553,8 +563,6 @@ fn tab_name(path: Option<&Path>) -> &str {
 // ── menus (A2 context menus / A3 menu bar) ───────────────────────────────────
 
 /// The top-level menu-bar titles, left to right.
-/// Kept for future use when the activity-bar menu is re-wired.
-#[allow(dead_code)]
 const MENU_BAR: [&str; 7] = ["File", "Edit", "View", "Go", "Run", "Terminal", "Help"];
 
 /// An action triggered by clicking a menu item.
@@ -761,6 +769,9 @@ struct App {
     menu_hover: Option<usize>,
     pending_quit: bool,
 
+    /// Hit rect for the breadcrumb theme-cycle button (updated each frame).
+    breadcrumb_theme_hit: Rect,
+
     /// Which window control button the cursor is hovering (for rendering).
     window_btn_hover: Option<WinBtn>,
     /// Whether the window is currently maximized.
@@ -869,6 +880,7 @@ impl App {
             menubar_hits: Vec::new(),
             menu_hover: None,
             pending_quit: false,
+            breadcrumb_theme_hit: Rect::ZERO,
             window_btn_hover: None,
             window_maximized: false,
             modified_files: std::collections::HashSet::new(),
@@ -2494,18 +2506,15 @@ impl App {
                 self.editor = Editor::from_text(&contents);
                 // Re-init syntax highlighter for the opened language.
                 let lang = language_for_path(path);
-                self.highlighter = match lang {
-                    Some("rust") => {
-                        match Highlighter::rust() {
-                            Ok(h) => Some(h),
-                            Err(e) => {
-                                tracing::warn!("rust highlighter: {e}");
-                                None
-                            }
+                self.highlighter = lang.and_then(Highlighter::for_language).and_then(|r| {
+                    match r {
+                        Ok(h) => Some(h),
+                        Err(e) => {
+                            tracing::warn!("highlighter init: {e}");
+                            None
                         }
                     }
-                    _ => None,
-                };
+                });
                 self.highlights = Highlights::default();
                 self.doc_dirty = true;
                 self.modified = false;
@@ -2723,6 +2732,14 @@ impl App {
         // Menu-bar label → open its dropdown.
         if let Some(i) = self.menubar_hits.iter().position(|r| r.contains(point)) {
             self.toggle_menu_bar(i);
+            return true;
+        }
+
+        // Breadcrumb theme button → cycle theme.
+        if self.breadcrumb_theme_hit.contains(point) {
+            if let Some(chrome) = &mut self.chrome {
+                chrome.cycle_theme();
+            }
             return true;
         }
 
@@ -3030,16 +3047,29 @@ impl App {
             chrome.paint(&mut self.scene);
         }
 
-        // Top menu bar (A3) — paint calls disabled for new custom title bar.
-        // The menu hit-test data (menubar_hits) is kept empty so menu dropdowns
-        // still work via right-click and keyboard shortcuts; they just have no
-        // visible labels in the activity bar strip.
-        // if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
-        //     let area = chrome.title_bar_rect();
-        //     let palette = chrome.palette();
-        //     self.menubar_hits =
-        //         text.paint_menu_bar(&mut self.scene, area, &MENU_BAR, self.menu_bar_open, &palette, self.scale);
-        // }
+        // Menu bar in the breadcrumb zone (bottom 36px of the title bar).
+        // Rendered before the breadcrumb so we know where the menu ends.
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let tb = chrome.title_bar_rect();
+            let s = self.scale;
+            let activity_h = 32.0 * s;
+            // Start after "EDEN" brand (~60px) to avoid overlap.
+            let menu_area = Rect::new(
+                tb.x0 + 60.0 * s,
+                tb.y0 + activity_h,
+                tb.x1 - 140.0 * s, // leave room for theme button on right
+                tb.y1,
+            );
+            let palette = chrome.palette();
+            self.menubar_hits = text.paint_menu_bar(
+                &mut self.scene,
+                menu_area,
+                &MENU_BAR,
+                self.menu_bar_open,
+                &palette,
+                s,
+            );
+        }
 
         // Window control button hover glow — tight circle around each button.
         if let Some(chrome) = &self.chrome {
@@ -3093,7 +3123,9 @@ impl App {
             );
         }
 
-        // Breadcrumb bar (bottom 36px of title bar): EDEN label + file path.
+        // Breadcrumb bar (bottom 36px of title bar): menu bar + file path + theme button.
+        // menu_end_x comes from the last menubar_hits rect so the path starts after the menu.
+        let menu_end_x = self.menubar_hits.last().map(|r| r.x1).unwrap_or(0.0);
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let area = chrome.title_bar_rect();
             let palette = chrome.palette();
@@ -3102,12 +3134,13 @@ impl App {
                     r.to_string_lossy().replace('\\', "/")
                 })
             });
-            text.paint_breadcrumb(
+            self.breadcrumb_theme_hit = text.paint_breadcrumb(
                 &mut self.scene,
                 area,
                 &BreadcrumbView {
                     path: rel_path.as_deref(),
                     theme_name: chrome.active_theme_name(),
+                    menu_end_x,
                 },
                 &palette,
                 self.scale,
@@ -3159,14 +3192,14 @@ impl App {
             let branch = self.git.as_ref().and_then(|g| g.branch_name());
             let lang = self.current_path.as_ref()
                 .and_then(|p| language_for_path(p))
-                .map(str::to_uppercase);
+                .map(str::to_owned);
             let caret = self.editor.primary();
             let line = self.editor.buffer().char_to_line(caret.head) + 1;
             let line_start = self.editor.buffer().line_to_char(line.saturating_sub(1));
             let col = caret.head.saturating_sub(line_start) + 1;
             let file_name = self.current_path.as_ref()
                 .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_uppercase());
+                .map(|n| n.to_string_lossy().into_owned());
             let autosaved_ago = self.last_autosave_time.map(|t| t.elapsed().as_secs() as u32);
             text.paint_status_bar(
                 &mut self.scene,

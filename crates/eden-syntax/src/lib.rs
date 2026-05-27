@@ -104,22 +104,178 @@ pub struct Highlighter {
 }
 
 impl Highlighter {
+    /// Dispatches to the appropriate language constructor by name.
+    ///
+    /// Returns `None` for unrecognised language IDs (the caller should fall
+    /// back to plain-text rendering with no highlight spans).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the grammar query fails to compile.
+    pub fn for_language(lang: &str) -> Option<Result<Self, SyntaxError>> {
+        match lang {
+            "rust" => Some(Self::rust()),
+            "javascript" | "js" => Some(Self::javascript()),
+            "typescript" | "ts" => Some(Self::typescript()),
+            "tsx" => Some(Self::tsx()),
+            "python" | "py" => Some(Self::python()),
+            "go" => Some(Self::go()),
+            "c" => Some(Self::c()),
+            "json" => Some(Self::json()),
+            "bash" | "sh" => Some(Self::bash()),
+            "html" => Some(Self::html()),
+            "css" => Some(Self::css()),
+            _ => None,
+        }
+    }
+
     /// Builds a highlighter for Rust.
     ///
     /// # Errors
     ///
     /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
     pub fn rust() -> Result<Self, SyntaxError> {
-        let language: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
-        let mut config = HighlightConfiguration::new(
-            language,
-            "rust",
-            tree_sitter_rust::HIGHLIGHTS_QUERY,
-            "",
-            "",
+        Self::build(tree_sitter_rust::LANGUAGE.into(), "rust", tree_sitter_rust::HIGHLIGHTS_QUERY)
+    }
+
+    /// Builds a highlighter for JavaScript.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn javascript() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_javascript::LANGUAGE.into(),
+            "javascript",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
         )
-        .map_err(|e| SyntaxError(e.to_string()))?;
-        let names: Vec<&str> = RECOGNIZED.iter().map(|(name, _)| *name).collect();
+    }
+
+    /// Builds a highlighter for TypeScript.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn typescript() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for TSX (TypeScript + JSX).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn tsx() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tsx",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for Python.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn python() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_python::LANGUAGE.into(),
+            "python",
+            tree_sitter_python::HIGHLIGHTS_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for Go.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn go() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_go::LANGUAGE.into(),
+            "go",
+            tree_sitter_go::HIGHLIGHTS_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for C.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn c() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            tree_sitter_c::HIGHLIGHT_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn json() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_json::LANGUAGE.into(),
+            "json",
+            tree_sitter_json::HIGHLIGHTS_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for Bash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn bash() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_bash::LANGUAGE.into(),
+            "bash",
+            tree_sitter_bash::HIGHLIGHT_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for HTML.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn html() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_html::LANGUAGE.into(),
+            "html",
+            tree_sitter_html::HIGHLIGHTS_QUERY,
+        )
+    }
+
+    /// Builds a highlighter for CSS.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyntaxError`] if the bundled highlight query fails to compile.
+    pub fn css() -> Result<Self, SyntaxError> {
+        Self::build(
+            tree_sitter_css::LANGUAGE.into(),
+            "css",
+            tree_sitter_css::HIGHLIGHTS_QUERY,
+        )
+    }
+
+    fn build(
+        language: tree_sitter::Language,
+        name: &str,
+        highlights_query: &str,
+    ) -> Result<Self, SyntaxError> {
+        let mut config = HighlightConfiguration::new(language, name, highlights_query, "", "")
+            .map_err(|e| SyntaxError(e.to_string()))?;
+        let names: Vec<&str> = RECOGNIZED.iter().map(|(n, _)| *n).collect();
         config.configure(&names);
         Ok(Self {
             inner: TsHighlighter::new(),
