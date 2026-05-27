@@ -1,5 +1,6 @@
 //! The editor chrome: the empty shell of title bar, sidebar, tab strip, editor
-//! canvas, and status bar — laid out with taffy, themed, and animated.
+//! canvas, logic panel, and status bar — laid out with taffy, themed, and
+//! animated.
 
 use eden_motion::{MotionPrefs, Spring, SpringConfig};
 use eden_theme::{Palette, Syntax, Theme};
@@ -10,22 +11,29 @@ use taffy::{
 use vello::Scene;
 use vello::kurbo::{Point, Rect};
 
+use crate::logic_panel::LogicPanel;
 use crate::paint::fill_rect;
 use crate::panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TerminalPanel, TitleBar};
 use crate::widget::{PaintCtx, Widget};
 
-// design: logical sizes (multiplied by the display scale). Heights and the
-// sidebar width are on the 4px grid (§6); the open sidebar is a comfortable
-// reading width for a file tree.
-const TITLE_H: f64 = 38.0;
-const TAB_H: f64 = 36.0;
-const STATUS_H: f64 = 26.0;
-const SIDEBAR_W: f64 = 248.0;
+// design: logical sizes (multiplied by the display scale). All values on the
+// 4px grid (§6). The title bar is split into a 32px activity bar and a 36px
+// breadcrumb row; the tab strip tightened to 32px to match the activity bar
+// height; the sidebar narrowed to 220px and a new 180px logic panel added on
+// the right.
+const TITLE_H: f64 = 68.0; // activity bar 32px + breadcrumb 36px
+const TAB_H: f64 = 32.0;   // tab strip
+const STATUS_H: f64 = 24.0; // status bar
+const SIDEBAR_W: f64 = 220.0; // left sidebar
+const LOGIC_W: f64 = 180.0;   // right logic panel
+
+// design: terminal panel height on the 4px grid.
+const TERMINAL_H: f64 = 220.0;
 
 /// A logical region of the chrome. Used for hit testing and to route hover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Region {
-    /// The top bar.
+    /// The top bar (activity bar + breadcrumb bar combined).
     TitleBar,
     /// The left sidebar.
     Sidebar,
@@ -37,12 +45,17 @@ pub enum Region {
     Terminal,
     /// The bottom status bar.
     StatusBar,
+    /// The right-side logic panel (AST outline / complexity).
+    LogicPanel,
 }
 
 impl Region {
     /// Whether hovering this region produces a visible response.
     fn is_interactive(self) -> bool {
-        matches!(self, Region::Sidebar | Region::TabStrip | Region::Terminal)
+        matches!(
+            self,
+            Region::Sidebar | Region::TabStrip | Region::Terminal | Region::LogicPanel
+        )
     }
 }
 
@@ -58,9 +71,6 @@ struct Invalidation {
     paint: bool,
 }
 
-// design: terminal panel height on the 4px grid.
-const TERMINAL_H: f64 = 220.0;
-
 /// Node handles into the taffy tree.
 struct Nodes {
     root: NodeId,
@@ -72,6 +82,7 @@ struct Nodes {
     editor: NodeId,
     terminal: NodeId,
     status_bar: NodeId,
+    logic_panel: NodeId,
 }
 
 /// The editor chrome. Owns the layout tree, the theme crossfade, and the
@@ -99,8 +110,12 @@ pub struct Chrome {
     terminal_h: Spring,
     terminal_open: bool,
 
-    // design: dims sidebar + tab strip while the user is typing in the editor,
-    // so eyes stay on the text. Breathes back when the cursor enters chrome.
+    logic_panel_spring: Spring,
+    logic_panel_open: bool,
+
+    // design: dims sidebar + tab strip + logic panel while the user is typing
+    // in the editor, so eyes stay on the text. Breathes back when the cursor
+    // enters chrome.
     focus_halo: Spring,
 
     invalid: Invalidation,
@@ -111,6 +126,7 @@ pub struct Chrome {
     editor: EditorArea,
     terminal_panel: TerminalPanel,
     status: StatusBar,
+    logic_panel: LogicPanel,
 }
 
 impl Chrome {
@@ -134,13 +150,16 @@ impl Chrome {
         let editor = leaf(&mut tree)?;
         let terminal = leaf(&mut tree)?;
         let status_bar = leaf(&mut tree)?;
+        let logic_panel = leaf(&mut tree)?;
         let main_col = tree.new_with_children(Style::default(), &[tab_strip, editor, terminal])?;
-        let body = tree.new_with_children(Style::default(), &[sidebar, main_col])?;
+        // Body row: sidebar | main_col | logic_panel
+        let body = tree.new_with_children(Style::default(), &[sidebar, main_col, logic_panel])?;
         let root = tree.new_with_children(Style::default(), &[title_bar, body, status_bar])?;
 
         let themes = Theme::builtins().to_vec();
-        let day = themes[0].palette;
-        let day_syntax = themes[0].syntax;
+        // Index 0 is Brutal Dark (the default for this design system).
+        let initial = themes[0].palette;
+        let initial_syntax = themes[0].syntax;
 
         let mut chrome = Self {
             tree,
@@ -154,6 +173,7 @@ impl Chrome {
                 editor,
                 terminal,
                 status_bar,
+                logic_panel,
             },
             width,
             height,
@@ -163,8 +183,8 @@ impl Chrome {
             sidebar_open: true,
             themes,
             active_theme: 0,
-            prev_palette: day,
-            prev_syntax: day_syntax,
+            prev_palette: initial,
+            prev_syntax: initial_syntax,
             // At rest at 1.0 so the displayed palette is exactly the active theme.
             theme_mix: Spring::with_config(1.0, prefs.resolve(SpringConfig::UNIT)),
             hover: Spring::with_config(0.0, prefs.resolve(SpringConfig::SNAPPY)),
@@ -172,6 +192,9 @@ impl Chrome {
             // design: terminal starts hidden (height 0).
             terminal_h: Spring::with_config(0.0, prefs.resolve(SpringConfig::DEFAULT)),
             terminal_open: false,
+            // design: logic panel starts open.
+            logic_panel_spring: Spring::new(LOGIC_W * scale),
+            logic_panel_open: true,
             focus_halo: Spring::with_config(0.0, prefs.resolve(SpringConfig::DEFAULT)),
             invalid: Invalidation { layout: true, paint: true },
             title_bar: TitleBar,
@@ -180,6 +203,7 @@ impl Chrome {
             editor: EditorArea,
             terminal_panel: TerminalPanel,
             status: StatusBar,
+            logic_panel: LogicPanel,
         };
         chrome.apply_styles();
         Ok(chrome)
@@ -215,8 +239,9 @@ impl Chrome {
         self.height = height;
         if (scale - self.scale).abs() > f64::EPSILON {
             self.scale = scale;
-            // Re-anchor the sidebar at the new scale without animating the jump.
+            // Re-anchor the springs at the new scale without animating the jump.
             self.sidebar.jump_to(self.sidebar_target());
+            self.logic_panel_spring.jump_to(self.logic_panel_target());
         }
         self.invalid.layout = true;
         self.invalid.paint = true;
@@ -230,6 +255,23 @@ impl Chrome {
             self.sidebar.jump_to(target);
         } else {
             self.sidebar.set_target(target);
+        }
+        self.invalid.layout = true;
+        self.invalid.paint = true;
+    }
+
+    /// Toggles the logic panel open/closed, animating its width.
+    pub fn toggle_logic_panel(&mut self) {
+        self.logic_panel_open = !self.logic_panel_open;
+        let target = if self.logic_panel_open {
+            LOGIC_W * self.scale
+        } else {
+            0.0
+        };
+        if self.prefs.reduce_motion {
+            self.logic_panel_spring.jump_to(target);
+        } else {
+            self.logic_panel_spring.set_target(target);
         }
         self.invalid.layout = true;
         self.invalid.paint = true;
@@ -264,10 +306,16 @@ impl Chrome {
             None => self.hover.set_target(0.0),
         }
         // Breathe the focus halo back when the cursor enters any chrome region
-        // that isn't the editor canvas (sidebar, tab strip, title bar, status).
+        // that isn't the editor canvas.
         if matches!(
             region,
-            Some(Region::Sidebar | Region::TabStrip | Region::TitleBar | Region::StatusBar)
+            Some(
+                Region::Sidebar
+                    | Region::TabStrip
+                    | Region::TitleBar
+                    | Region::StatusBar
+                    | Region::LogicPanel
+            )
         ) {
             self.focus_halo.set_target(0.0);
         }
@@ -292,6 +340,11 @@ impl Chrome {
             self.invalid.paint = true;
         }
         if self.terminal_h.step(dt) {
+            animating = true;
+            self.invalid.layout = true;
+            self.invalid.paint = true;
+        }
+        if self.logic_panel_spring.step(dt) {
             animating = true;
             self.invalid.layout = true;
             self.invalid.paint = true;
@@ -389,6 +442,12 @@ impl Chrome {
         self.region_rect(Region::StatusBar)
     }
 
+    /// The absolute rect of the logic panel.
+    #[must_use]
+    pub fn logic_panel_rect(&self) -> Rect {
+        self.region_rect(Region::LogicPanel)
+    }
+
     fn region_rect(&self, want: Region) -> Rect {
         self.regions()
             .into_iter()
@@ -429,14 +488,15 @@ impl Chrome {
 
         self.paint_dividers(scene, &palette);
 
-        // Focus halo: dim sidebar + tab strip when typing in the editor.
+        // Focus halo: dim sidebar + tab strip + logic panel when typing.
         let halo = self.focus_halo.value();
         if halo > 0.01 {
             let alpha = (halo * 96.0) as u8;
             let dim = crate::paint::to_rgba8_alpha(palette.background, alpha);
             let sidebar_r = self.region_rect(Region::Sidebar);
             let tab_r = self.region_rect(Region::TabStrip);
-            for rect in [sidebar_r, tab_r] {
+            let logic_r = self.region_rect(Region::LogicPanel);
+            for rect in [sidebar_r, tab_r, logic_r] {
                 if rect.width() > 1.0 && rect.height() > 1.0 {
                     fill_rect(scene, rect, dim);
                 }
@@ -459,6 +519,14 @@ impl Chrome {
     fn terminal_target(&self) -> f64 {
         if self.terminal_open {
             TERMINAL_H * self.scale
+        } else {
+            0.0
+        }
+    }
+
+    fn logic_panel_target(&self) -> f64 {
+        if self.logic_panel_open {
+            LOGIC_W * self.scale
         } else {
             0.0
         }
@@ -490,11 +558,12 @@ impl Chrome {
             Region::EditorArea => &self.editor,
             Region::Terminal => &self.terminal_panel,
             Region::StatusBar => &self.status,
+            Region::LogicPanel => &self.logic_panel,
         }
     }
 
-    /// Pushes current styles (driven by size, scale, and the sidebar spring)
-    /// into the taffy tree and recomputes the layout.
+    /// Pushes current styles (driven by size, scale, and the sidebar/logic
+    /// panel springs) into the taffy tree and recomputes the layout.
     fn apply_styles(&mut self) {
         let s = self.scale;
         let row = |height: f64| Style {
@@ -560,6 +629,14 @@ impl Chrome {
             flex_shrink: 0.0,
             ..Style::default()
         };
+        let logic_panel_style = Style {
+            size: TaffySize {
+                width: length(self.logic_panel_spring.value().max(0.0) as f32),
+                height: percent(1.0_f32),
+            },
+            flex_shrink: 0.0,
+            ..Style::default()
+        };
 
         // Errors here only occur for invalid node ids, which cannot happen.
         let _ = self.tree.set_style(self.nodes.root, root_style);
@@ -571,6 +648,7 @@ impl Chrome {
         let _ = self.tree.set_style(self.nodes.editor, editor_style);
         let _ = self.tree.set_style(self.nodes.terminal, terminal_style);
         let _ = self.tree.set_style(self.nodes.status_bar, row(STATUS_H));
+        let _ = self.tree.set_style(self.nodes.logic_panel, logic_panel_style);
 
         let _ = self.tree.compute_layout(
             self.nodes.root,
@@ -582,11 +660,18 @@ impl Chrome {
     }
 
     /// Computes absolute rects for each painted region from the taffy layout.
-    fn regions(&self) -> [(Region, Rect); 6] {
+    fn regions(&self) -> [(Region, Rect); 7] {
         let loc = |node: NodeId| {
             self.tree
                 .layout(node)
-                .map(|l| (f64::from(l.location.x), f64::from(l.location.y), f64::from(l.size.width), f64::from(l.size.height)))
+                .map(|l| {
+                    (
+                        f64::from(l.location.x),
+                        f64::from(l.location.y),
+                        f64::from(l.size.width),
+                        f64::from(l.size.height),
+                    )
+                })
                 .unwrap_or((0.0, 0.0, 0.0, 0.0))
         };
         let rect = |ox: f64, oy: f64, t: (f64, f64, f64, f64)| {
@@ -601,11 +686,15 @@ impl Chrome {
         let tab = loc(self.nodes.tab_strip);
         let editor = loc(self.nodes.editor);
         let terminal = loc(self.nodes.terminal);
+        let logic = loc(self.nodes.logic_panel);
 
         let body_ox = body.0;
         let body_oy = body.1;
         let main_ox = body_ox + main.0;
         let main_oy = body_oy + main.1;
+        // Logic panel is in the body row, to the right of main_col.
+        let logic_ox = body_ox;
+        let logic_oy = body_oy;
 
         [
             (Region::TitleBar, rect(0.0, 0.0, title)),
@@ -614,19 +703,22 @@ impl Chrome {
             (Region::EditorArea, rect(main_ox, main_oy, editor)),
             (Region::Terminal, rect(main_ox, main_oy, terminal)),
             (Region::StatusBar, rect(0.0, 0.0, status)),
+            (Region::LogicPanel, rect(logic_ox, logic_oy, logic)),
         ]
     }
 
     fn paint_dividers(&self, scene: &mut Scene, palette: &Palette) {
         let t = self.scale.max(1.0); // ~1 logical px
         let regions = self.regions();
-        let find = |want: Region| regions.iter().find(|(r, _)| *r == want).map(|(_, rc)| *rc);
-        let (Some(title), Some(sidebar), Some(tab), Some(terminal), Some(status)) = (
+        let find =
+            |want: Region| regions.iter().find(|(r, _)| *r == want).map(|(_, rc)| *rc);
+        let (Some(title), Some(sidebar), Some(tab), Some(terminal), Some(status), Some(logic)) = (
             find(Region::TitleBar),
             find(Region::Sidebar),
             find(Region::TabStrip),
             find(Region::Terminal),
             find(Region::StatusBar),
+            find(Region::LogicPanel),
         ) else {
             return;
         };
@@ -636,14 +728,34 @@ impl Chrome {
         // Above the status bar.
         fill_rect(scene, Rect::new(0.0, status.y0, self.width, status.y0 + t), palette.divider);
         // Under the tab strip.
-        fill_rect(scene, Rect::new(tab.x0, tab.y1 - t, self.width, tab.y1), palette.divider);
+        fill_rect(
+            scene,
+            Rect::new(tab.x0, tab.y1 - t, tab.x1 + logic.width(), tab.y1),
+            palette.divider,
+        );
         // Between sidebar and main column (only when the sidebar is showing).
         if sidebar.width() > 2.0 {
-            fill_rect(scene, Rect::new(sidebar.x1 - t, title.y1, sidebar.x1, status.y0), palette.divider);
+            fill_rect(
+                scene,
+                Rect::new(sidebar.x1 - t, title.y1, sidebar.x1, status.y0),
+                palette.divider,
+            );
         }
         // Above the terminal panel (only when it has height).
         if terminal.height() > 2.0 {
-            fill_rect(scene, Rect::new(terminal.x0, terminal.y0, terminal.x1, terminal.y0 + t), palette.divider);
+            fill_rect(
+                scene,
+                Rect::new(terminal.x0, terminal.y0, terminal.x1, terminal.y0 + t),
+                palette.divider,
+            );
+        }
+        // Left border of the logic panel (only when it has width).
+        if logic.width() > 2.0 {
+            fill_rect(
+                scene,
+                Rect::new(logic.x0, title.y1, logic.x0 + t, status.y0),
+                palette.divider,
+            );
         }
     }
 }
@@ -660,13 +772,17 @@ mod tests {
     fn regions_tile_the_window() {
         let c = chrome();
         let regions = c.regions();
+        // There are 7 regions.
+        assert_eq!(regions.len(), 7);
         // Title spans full width at the top.
         let title = regions.iter().find(|(r, _)| *r == Region::TitleBar).unwrap().1;
         assert_eq!(title.x0, 0.0);
         assert!((title.width() - 1200.0).abs() < 0.5);
+        assert!((title.height() - TITLE_H).abs() < 0.5);
         // Status sits at the bottom.
         let status = regions.iter().find(|(r, _)| *r == Region::StatusBar).unwrap().1;
         assert!((status.y1 - 800.0).abs() < 0.5);
+        assert!((status.height() - STATUS_H).abs() < 0.5);
         // Editor is to the right of the sidebar.
         let sidebar = regions.iter().find(|(r, _)| *r == Region::Sidebar).unwrap().1;
         let editor = regions.iter().find(|(r, _)| *r == Region::EditorArea).unwrap().1;
@@ -675,15 +791,25 @@ mod tests {
         // Terminal starts hidden (height 0).
         let terminal = regions.iter().find(|(r, _)| *r == Region::Terminal).unwrap().1;
         assert!(terminal.height() < 0.5);
+        // Logic panel is present and to the right of the editor.
+        let logic = regions.iter().find(|(r, _)| *r == Region::LogicPanel).unwrap().1;
+        assert!((logic.width() - LOGIC_W).abs() < 0.5);
+        assert!(logic.x0 >= editor.x1 - 0.5);
+        // Tab strip height matches constant.
+        let tab = regions.iter().find(|(r, _)| *r == Region::TabStrip).unwrap().1;
+        assert!((tab.height() - TAB_H).abs() < 0.5);
     }
 
     #[test]
     fn hit_test_resolves_regions() {
         let c = chrome();
         assert_eq!(c.hit_test(Point::new(600.0, 5.0)), Some(Region::TitleBar));
+        // Sidebar starts at x=0 in the body, which is below the title bar.
         assert_eq!(c.hit_test(Point::new(10.0, 400.0)), Some(Region::Sidebar));
         assert_eq!(c.hit_test(Point::new(600.0, 790.0)), Some(Region::StatusBar));
         assert_eq!(c.hit_test(Point::new(600.0, 400.0)), Some(Region::EditorArea));
+        // Logic panel is at the far right.
+        assert_eq!(c.hit_test(Point::new(1190.0, 400.0)), Some(Region::LogicPanel));
     }
 
     #[test]
@@ -699,6 +825,21 @@ mod tests {
         c.apply_styles();
         let sidebar = c.regions().iter().find(|(r, _)| *r == Region::Sidebar).unwrap().1;
         assert!(sidebar.width() < 0.5, "sidebar did not collapse: {}", sidebar.width());
+    }
+
+    #[test]
+    fn collapsing_logic_panel_animates_then_frees_space() {
+        let mut c = chrome();
+        c.toggle_logic_panel();
+        // Drive the animation to completion.
+        let mut frames = 0;
+        while c.step(1.0 / 60.0) {
+            frames += 1;
+            assert!(frames < 600);
+        }
+        c.apply_styles();
+        let logic = c.regions().iter().find(|(r, _)| *r == Region::LogicPanel).unwrap().1;
+        assert!(logic.width() < 0.5, "logic panel did not collapse: {}", logic.width());
     }
 
     #[test]

@@ -6,12 +6,14 @@
 //! `Scene`. Text, the editor buffer, and real content arrive in later phases.
 
 mod chrome;
+mod logic_panel;
 mod paint;
 mod panels;
 mod text;
 mod widget;
 
 pub use chrome::{Chrome, Region};
+pub use logic_panel::LogicPanel;
 pub use paint::{fill_rect, fill_rrect, to_color};
 pub use panels::{EditorArea, SidebarPanel, StatusBar, TabStrip, TerminalPanel, TitleBar};
 pub use text::{

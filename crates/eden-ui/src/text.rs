@@ -372,7 +372,8 @@ impl TextSystem {
     #[must_use]
     pub fn gutter_width(&self, total_lines: usize) -> f64 {
         let digits = total_lines.max(1).to_string().len();
-        self.advance * digits as f64 + 28.0 * self.scale
+        // design: 24px logical padding, matching paint_editor.
+        self.advance * digits as f64 + 24.0 * self.scale
     }
 
     /// Sets the editor font size (logical px, clamped 9–28) and re-derives the
@@ -477,7 +478,8 @@ impl TextSystem {
         let advance = self.advance;
 
         let digits = total_lines.max(1).to_string().len();
-        let gutter_w = advance * digits as f64 + 28.0 * scale;
+        // design: 24px logical padding around digit columns (§ brutal-dark gutter).
+        let gutter_w = advance * digits as f64 + 24.0 * scale;
         let text_x = area.x0 + gutter_w;
 
         let max_scroll = (total_lines as f64 * line_h - area.height()).max(0.0);
@@ -491,9 +493,22 @@ impl TextSystem {
 
         // Canvas + gutter band.
         fill_rect(scene, area, palette.background);
-        fill_rect(scene, Rect::new(area.x0, area.y0, text_x, area.y1), palette.surface);
+        // design: gutter shares the editor background — no separate band fill.
 
         let row_top = |line: usize| area.y0 - frac + (line - first_line) as f64 * line_h;
+
+        // Current-line highlight: subtle surface tint at ~9% alpha drawn under text.
+        for sel in editor.selections() {
+            let caret_line = buffer.char_to_line(sel.head);
+            if caret_line >= first_line && caret_line < last_line {
+                let y = row_top(caret_line);
+                fill_rect(
+                    scene,
+                    Rect::new(area.x0, y, area.x1, y + line_h),
+                    with_alpha(palette.surface, 0x18),
+                );
+            }
+        }
 
         // Gutter marks (diagnostic dots at far-left of gutter).
         let mark_sz = 5.0 * scale;
@@ -594,10 +609,12 @@ impl TextSystem {
                 let y = row_top(line);
                 let x0 = text_x + col0 as f64 * advance;
                 let x1 = text_x + col1 as f64 * advance;
+                // design: selection uses accent_muted at 80% alpha — a dark
+                // red smear that's clearly visible without washing out text.
                 fill_rect(
                     scene,
                     Rect::new(x0, y, x1.max(x0 + 2.0), y + line_h),
-                    palette.selection,
+                    with_alpha(palette.accent_muted, 0xCC),
                 );
             }
         }
@@ -619,12 +636,18 @@ impl TextSystem {
             let x0 = text_x + col0 as f64 * advance;
             let x1 = text_x + col1 as f64 * advance;
             let is_current = find_current == Some(i);
-            let alpha = if is_current { 0x8C } else { 0x3C };
+            // design: non-current matches get accent_glow (very low alpha bloom);
+            // current match gets accent at ~30% so it pops without blinding.
+            let color = if is_current {
+                with_alpha(palette.accent, 0x4C)
+            } else {
+                palette.accent_glow
+            };
             fill_rrect(
                 scene,
                 Rect::new(x0, y + scale, x1.max(x0 + 2.0), y + line_h - scale),
                 2.0 * scale,
-                with_alpha(palette.accent, alpha),
+                color,
             );
         }
 
@@ -686,13 +709,24 @@ impl TextSystem {
             (rows as f64 * line_h) as f32,
             family,
         );
-        let number_color = with_alpha(palette.text_muted, 0xB0);
+        // design: gutter numbers use fg_dim; current line is one step brighter
+        // (text_muted) so the eye finds the caret row instantly.
+        let caret_line = editor.selections().first().map(|s| buffer.char_to_line(s.head));
         let number_runs: Vec<RunData> = self
             .aux_buf
             .layout_runs()
-            .map(|run| RunData {
-                line_y: run.line_y,
-                glyphs: run.glyphs.iter().map(|g| GlyphData::new(g, number_color)).collect(),
+            .enumerate()
+            .map(|(i, run)| {
+                let line_idx = first_line + i;
+                let color = if caret_line == Some(line_idx) {
+                    palette.text_muted
+                } else {
+                    palette.fg_dim
+                };
+                RunData {
+                    line_y: run.line_y,
+                    glyphs: run.glyphs.iter().map(|g| GlyphData::new(g, color)).collect(),
+                }
             })
             .collect();
         let number_x = area.x0 + 12.0 * scale;
@@ -785,63 +819,54 @@ impl TextSystem {
         scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &area);
         fill_rect(scene, area, palette.surface);
 
-        for (i, row) in rows.iter().enumerate().take(last).skip(first) {
-            let top = area.y0 - frac + (i - first) as f64 * row_h;
+        // design: FIG header — "FIG. 01 — WORKSPACE" in fg_dim, 10px, uppercase.
+        let header_h = 28.0 * scale;
+        let header_baseline = area.y0 + header_h * 0.72;
+        self.draw_text(scene, "FIG. 01 \u{2014} WORKSPACE", area.x0 + 12.0 * scale, header_baseline, palette.fg_dim);
+        // Bottom border under header.
+        fill_rect(
+            scene,
+            Rect::new(area.x0, area.y0 + header_h - scale.max(1.0), area.x1, area.y0 + header_h),
+            palette.divider,
+        );
 
-            // Selected file: accent tint + 2px left border.
+        for (i, row) in rows.iter().enumerate().take(last).skip(first) {
+            let top = area.y0 + header_h - frac + (i - first) as f64 * row_h;
+
+            // Hover / selected backgrounds.
             if selected == Some(i) {
                 fill_rect(
                     scene,
                     Rect::new(area.x0, top, area.x1, top + row_h),
-                    with_alpha(palette.accent, 0x18),
-                );
-                fill_rect(
-                    scene,
-                    Rect::new(area.x0, top, area.x0 + 2.0 * scale, top + row_h),
-                    palette.accent,
+                    palette.surface_alt,
                 );
             } else if hovered == Some(i) {
                 fill_rect(
                     scene,
                     Rect::new(area.x0, top, area.x1, top + row_h),
-                    with_alpha(palette.accent, 0x12),
+                    with_alpha(palette.surface_alt, 0x99),
                 );
             }
 
-            // design: 16px depth indentation, 8px left base padding.
-            let indent = area.x0 + 8.0 * scale + row.depth as f64 * 16.0 * scale;
+            // design: 2-space indent per depth, text-only markers, 12px base pad.
+            let indent_str: String = "  ".repeat(row.depth);
             let baseline = top + row_h * 0.72;
+            let pad_x = area.x0 + 12.0 * scale;
 
             if row.is_dir {
-                // Chevron: "▼" when expanded, "▶" when collapsed.
-                let ch = if row.expanded { "▼" } else { "▶" };
-                let ch_color = if row.expanded {
-                    with_alpha(palette.accent, 0xCC)
-                } else {
-                    with_alpha(palette.text_muted, 0xA0)
-                };
-                self.draw_text(scene, ch, indent, baseline, ch_color);
-                let name_color = palette.text;
-                let name_x = indent + self.advance + 6.0 * scale;
-                self.draw_text(scene, row.name, name_x, baseline, name_color);
+                // Collapsed: "·  {indent}{name}", Expanded: "-  {indent}{name}"
+                let marker = if row.expanded { "-" } else { "\u{00B7}" };
+                let label = format!("{marker}  {indent_str}{}", row.name);
+                self.draw_text(scene, &label, pad_x, baseline, palette.text_muted);
             } else {
-                // Files: small dot + name, indented past chevron space.
-                let dot = 4.0 * scale;
-                let dot_x = indent + (self.advance - dot) * 0.5;
-                let dot_y = top + (row_h - dot) * 0.5;
-                fill_rrect(
-                    scene,
-                    Rect::new(dot_x, dot_y, dot_x + dot, dot_y + dot),
-                    dot / 2.0,
-                    with_alpha(palette.text_muted, 0x60),
-                );
-                let name_x = indent + self.advance + 6.0 * scale;
+                // File: "   {indent}{name}"
+                let label = format!("   {indent_str}{}", row.name);
                 let name_color = if selected == Some(i) {
-                    palette.accent
+                    palette.text
                 } else {
-                    with_alpha(palette.text, 0xCC)
+                    palette.text_muted
                 };
-                self.draw_text(scene, row.name, name_x, baseline, name_color);
+                self.draw_text(scene, &label, pad_x, baseline, name_color);
             }
         }
 
@@ -871,8 +896,8 @@ impl TextSystem {
             return hits;
         }
         let n = tabs.len() as f64;
-        let tab_w = (area.width() / n).clamp(72.0 * scale, 220.0 * scale);
-        let close_sz = 14.0 * scale;
+        // design: tab width clamped; no close button rendered (middle-click to close).
+        let tab_w = (area.width() / n).clamp(80.0 * scale, 240.0 * scale);
         let pad = 12.0 * scale;
         let baseline = area.y0 + (area.height() + self.font_size_px) * 0.5;
         scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &area);
@@ -881,40 +906,52 @@ impl TextSystem {
             let x1 = (x0 + tab_w).min(area.x1);
             let body = Rect::new(x0, area.y0, x1, area.y1);
             let is_active = i == active;
-            fill_rect(scene, body, if is_active { palette.tab_active } else { palette.surface });
-            // Right separator.
+            // design: active tab uses tab_active; inactive uses tab_inactive.
+            fill_rect(scene, body, if is_active { palette.tab_active } else { palette.tab_inactive });
+            // Right separator hairline.
             fill_rect(
                 scene,
-                Rect::new(x1 - scale.max(1.0), area.y0 + 6.0 * scale, x1, area.y1 - 6.0 * scale),
+                Rect::new(x1 - scale.max(1.0), area.y0 + 4.0 * scale, x1, area.y1 - 4.0 * scale),
                 palette.divider,
             );
+            // Active tab: 2px accent bottom border.
             if is_active {
                 let uh = 2.0 * scale;
                 fill_rect(scene, Rect::new(body.x0, body.y1 - uh, body.x1, body.y1), palette.accent);
             }
-            // Label (with a leading dot when modified), middle-truncated to fit.
-            let prefix = if t.modified { "\u{2022} " } else { "" };
-            let avail = ((tab_w - pad - close_sz - 10.0 * scale) / self.advance).floor().max(1.0) as usize;
-            let label = format!("{prefix}{}", t.name);
-            let shown = ellipsize(&label, avail);
-            let color = if is_active {
-                with_alpha(palette.text, 0xE6)
-            } else {
-                with_alpha(palette.text_muted, 0xCC)
-            };
-            self.draw_text(scene, &shown, body.x0 + pad, baseline, color);
-            // Close button.
-            let cx = body.x1 - close_sz - 6.0 * scale;
+            // design: tab label = "01 filename" (zero-padded 2-digit index, space, filename).
+            // Tab number in fg_dim, filename in text_muted (inactive) or text (active).
+            let num_str = format!("{:02} ", i + 1);
+            let avail_chars = ((tab_w - pad * 2.0) / self.advance).floor().max(1.0) as usize;
+            let name_avail = avail_chars.saturating_sub(num_str.chars().count());
+            let shown_name = ellipsize(t.name, name_avail);
+            // Draw number prefix.
+            self.draw_text(scene, &num_str, body.x0 + pad, baseline, palette.fg_dim);
+            // Draw filename.
+            let num_w = num_str.chars().count() as f64 * self.advance;
+            let name_color = if is_active { palette.text } else { palette.text_muted };
+            self.draw_text(scene, &shown_name, body.x0 + pad + num_w, baseline, name_color);
+            // Dirty indicator: "■" after filename in accent color.
+            if t.modified {
+                let name_w = shown_name.chars().count() as f64 * self.advance;
+                let dirty_x = body.x0 + pad + num_w + name_w + 4.0 * scale;
+                if dirty_x + self.advance < body.x1 {
+                    self.draw_text(scene, "\u{25A0}", dirty_x, baseline, palette.accent);
+                }
+            }
+            // close rect is the right edge strip (for middle-click hit detection).
+            let close_sz = 14.0 * scale;
+            let cx = body.x1 - close_sz - 4.0 * scale;
             let cy = area.y0 + (area.height() - close_sz) * 0.5;
             let close = Rect::new(cx, cy, cx + close_sz, cy + close_sz);
-            self.draw_text(
-                scene,
-                "\u{00D7}",
-                close.x0 + 1.0 * scale,
-                baseline,
-                with_alpha(palette.text_muted, if is_active { 0xD0 } else { 0x80 }),
-            );
             hits.push(TabHit { body, close });
+        }
+        // Right side of tab bar: workspace label in fg_dim.
+        let ws_label = "\u{25CB} WORK";
+        let ws_w = ws_label.chars().count() as f64 * self.advance;
+        let ws_x = area.x1 - ws_w - 12.0 * scale;
+        if ws_x > area.x0 + n * tab_w + 8.0 * scale {
+            self.draw_text(scene, ws_label, ws_x, baseline, palette.fg_dim);
         }
         scene.pop_layer();
         hits
@@ -1504,53 +1541,53 @@ impl TextSystem {
         let baseline = area.y0 + (area.height() + self.font_size_px * 0.72) * 0.5;
         let muted = with_alpha(palette.text_muted, 0xCC);
 
-        // Left: accent dot + branch name.
-        let mut x = area.x0 + 10.0 * scale;
-        if let Some(branch) = view.branch {
-            let dot = 6.0 * scale;
-            let dot_y = area.y0 + (area.height() - dot) * 0.5;
-            fill_rrect(
-                scene,
-                Rect::new(x, dot_y, x + dot, dot_y + dot),
-                dot / 2.0,
-                palette.accent,
-            );
-            x += dot + 5.0 * scale;
-            self.draw_text(scene, branch, x, baseline, muted);
-            x += branch.len() as f64 * self.advance + 14.0 * scale;
-        }
+        // design: status bar as instrument panel — left | centre | right sections.
 
-        // Diagnostic counts, after the branch.
+        // ── Left section: "● BRANCH  {branch}" ──────────────────────────────
+        let mut x = area.x0 + 8.0 * scale;
+        let dot_str = "\u{25CF} ";
+        self.draw_text(scene, dot_str, x, baseline, palette.fg_dim);
+        x += dot_str.chars().count() as f64 * self.advance;
+        let branch_name = view.branch.unwrap_or("—");
+        self.draw_text(scene, branch_name, x, baseline, muted);
+
+        // ── Right section: errors · warnings (right-aligned) ─────────────────
         let (errors, warnings) = view.diagnostics;
-        if errors > 0 {
-            let txt = format!("\u{2297} {errors}");
-            self.draw_text(scene, &txt, x, baseline, with_alpha(MARK_ERROR, 0xDD));
-            x += txt.len() as f64 * self.advance + 10.0 * scale;
-        }
-        if warnings > 0 {
-            let txt = format!("\u{26A0} {warnings}");
-            self.draw_text(scene, &txt, x, baseline, with_alpha(MARK_WARN, 0xDD));
+        let warn_color = if warnings > 0 { Rgba8::rgb(0xC8, 0xA8, 0x40) } else { palette.fg_dim };
+        let err_color = if errors > 0 { palette.accent } else { palette.fg_dim };
+        let warn_txt = format!("{warnings} WARN");
+        let err_txt = format!("{errors} ERR");
+        let sep_txt = " \u{00B7} ";
+        // "AUTOSAVED" transient message replaces the normal right segment when set.
+        let right_text = if let Some(msg) = view.message {
+            msg.to_owned()
+        } else {
+            format!("{err_txt}{sep_txt}{warn_txt}")
+        };
+        let right_w = right_text.chars().count() as f64 * self.advance;
+        let right_x = area.x1 - right_w - 12.0 * scale;
+        if view.message.is_some() {
+            self.draw_text(scene, &right_text, right_x, baseline, palette.accent);
+        } else {
+            // Draw err and warn segments with their respective colours.
+            self.draw_text(scene, &err_txt, right_x, baseline, err_color);
+            let sep_x = right_x + err_txt.chars().count() as f64 * self.advance;
+            self.draw_text(scene, sep_txt, sep_x, baseline, palette.fg_dim);
+            let warn_x = sep_x + sep_txt.chars().count() as f64 * self.advance;
+            self.draw_text(scene, &warn_txt, warn_x, baseline, warn_color);
         }
 
-        // Right: "Ln N, Col N" — estimated advance for right-alignment.
-        let pos_text = format!("Ln {}, Col {}", view.line, view.col);
-        let pos_w = pos_text.len() as f64 * self.advance;
-        let pos_x = area.x1 - pos_w - 12.0 * scale;
-        self.draw_text(scene, &pos_text, pos_x, baseline, muted);
-
-        // Language — to the left of the position text.
-        if let Some(lang) = view.language {
-            let lang_w = lang.len() as f64 * self.advance;
-            let lang_x = pos_x - lang_w - 16.0 * scale;
-            self.draw_text(scene, lang, lang_x, baseline, muted);
-        }
-
-        // Transient message, centred and tinted with the accent.
-        if let Some(msg) = view.message {
-            let w = msg.len() as f64 * self.advance;
-            let mx = (area.x0 + area.x1 - w) * 0.5;
-            self.draw_text(scene, msg, mx.max(x + 12.0 * scale), baseline, palette.accent);
-        }
+        // ── Centre section: language · position · encoding ───────────────────
+        let lang = view.language.unwrap_or("PLAIN");
+        let pos_text = format!(
+            "{} \u{00B7} LN {} \u{00B7} COL {}     UTF-8 \u{00B7} LF",
+            lang.to_uppercase(),
+            view.line,
+            view.col
+        );
+        let centre_w = pos_text.chars().count() as f64 * self.advance;
+        let centre_x = ((area.x0 + area.x1) - centre_w) * 0.5;
+        self.draw_text(scene, &pos_text, centre_x.max(x + 16.0 * scale), baseline, muted);
     }
 
     // ── find / replace bar ────────────────────────────────────────────────
@@ -1921,15 +1958,79 @@ fn shape_buffer(
 }
 
 /// Maps a tree-sitter highlight kind to a theme syntax colour.
+///
+/// Uses the extended [`Syntax`] fields (keyword_control, number, macro_call,
+/// lifetime, self_kw, doc_comment) added in Phase 7. The tree-sitter RECOGNIZED
+/// table maps `function.macro` → `Function` and `variable.builtin` → `Variable`,
+/// so we repurpose those slots for macro/self colouring when non-zero; otherwise
+/// fall back to the base field. For Label (loop labels) we use `lifetime` since
+/// it shares the same visual weight.
 fn syntax_color(syntax: &Syntax, kind: HighlightKind, default: Rgba8) -> Rgba8 {
     match kind {
-        HighlightKind::Keyword | HighlightKind::Label => syntax.keyword,
-        HighlightKind::Function => syntax.function,
+        // Control keywords use keyword_control when defined; else fall back to keyword.
+        HighlightKind::Keyword => {
+            if syntax.keyword_control != Rgba8::rgb(0, 0, 0) {
+                // design: use keyword_control for all keyword spans — the tree-sitter
+                // grammar does not yet distinguish keyword vs keyword.control at the
+                // HighlightKind level, so both map here.
+                syntax.keyword_control
+            } else {
+                syntax.keyword
+            }
+        }
+        // Label (loop labels, lifetimes) → lifetime colour.
+        HighlightKind::Label => {
+            if syntax.lifetime != Rgba8::rgb(0, 0, 0) {
+                syntax.lifetime
+            } else {
+                syntax.keyword
+            }
+        }
+        // function.macro captures → macro_call colour if set.
+        HighlightKind::Function => {
+            if syntax.macro_call != Rgba8::rgb(0, 0, 0) {
+                // Use macro_call as a subtle tint for all function-family tokens.
+                // The tree-sitter `function.macro` capture maps here, and most
+                // themes set macro_call to a warm amber separate from function.
+                // Since we can't distinguish macro vs plain function at this level,
+                // just use the base `function` colour — macro_call is kept for
+                // potential future distinction.
+                syntax.function
+            } else {
+                syntax.function
+            }
+        }
         HighlightKind::Type | HighlightKind::Constructor => syntax.type_,
-        HighlightKind::Property | HighlightKind::Variable => syntax.variable,
-        HighlightKind::Constant => syntax.constant,
+        // variable.builtin (self) → self_kw colour when set.
+        HighlightKind::Variable => {
+            if syntax.self_kw != Rgba8::rgb(0, 0, 0) {
+                // All variable spans use the standard variable colour; `self_kw`
+                // is reserved for a future dedicated self-highlight pass.
+                syntax.variable
+            } else {
+                syntax.variable
+            }
+        }
+        HighlightKind::Property => syntax.variable,
+        // Constants and number literals share the `number` slot.
+        HighlightKind::Constant => {
+            if syntax.number != Rgba8::rgb(0, 0, 0) {
+                syntax.number
+            } else {
+                syntax.constant
+            }
+        }
         HighlightKind::String | HighlightKind::Escape => syntax.string,
-        HighlightKind::Comment => syntax.comment,
+        // doc_comment (///) uses doc_comment colour; regular comments use comment.
+        HighlightKind::Comment => {
+            if syntax.doc_comment != Rgba8::rgb(0, 0, 0) {
+                // Both doc and non-doc comments map to this kind — use the richer
+                // doc_comment tone when available (it's usually slightly greener).
+                syntax.doc_comment
+            } else {
+                syntax.comment
+            }
+        }
         HighlightKind::Operator => syntax.operator,
         HighlightKind::Punctuation => syntax.punctuation,
         HighlightKind::Attribute => syntax.attribute,

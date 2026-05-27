@@ -45,7 +45,15 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-const CLEAR: Color = Color::from_rgb8(0xFB, 0xF8, 0xF3);
+const CLEAR: Color = Color::from_rgb8(0x0A, 0x0A, 0x0C);
+
+/// The three custom window control buttons (close / maximize / minimize).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WinBtn {
+    Close,
+    Maximize,
+    Minimize,
+}
 
 /// Cursor must be still for this long before a hover request is fired.
 const HOVER_DELAY: Duration = Duration::from_millis(400);
@@ -441,6 +449,8 @@ fn tab_name(path: Option<&Path>) -> &str {
 // ── menus (A2 context menus / A3 menu bar) ───────────────────────────────────
 
 /// The top-level menu-bar titles, left to right.
+/// Kept for future use when the activity-bar menu is re-wired.
+#[allow(dead_code)]
 const MENU_BAR: [&str; 7] = ["File", "Edit", "View", "Go", "Run", "Terminal", "Help"];
 
 /// An action triggered by clicking a menu item.
@@ -647,6 +657,11 @@ struct App {
     menu_hover: Option<usize>,
     pending_quit: bool,
 
+    /// Which window control button the cursor is hovering (for rendering).
+    window_btn_hover: Option<WinBtn>,
+    /// Whether the window is currently maximized.
+    window_maximized: bool,
+
     // Find / replace (Ctrl+F / Ctrl+H) and go-to-line (Ctrl+G).
     find_open: bool,
     find: FindState,
@@ -743,6 +758,8 @@ impl App {
             menubar_hits: Vec::new(),
             menu_hover: None,
             pending_quit: false,
+            window_btn_hover: None,
+            window_maximized: false,
             find_open: false,
             find: FindState::default(),
             find_hits: None,
@@ -773,7 +790,8 @@ impl App {
     fn activate(&mut self, event_loop: &ActiveEventLoop) -> Result<ActiveWindow> {
         let attributes = WindowAttributes::default()
             .with_title("Eden")
-            .with_inner_size(LogicalSize::new(1100.0, 720.0));
+            .with_decorations(false)
+            .with_inner_size(LogicalSize::new(1200.0, 800.0));
         let window = Arc::new(
             event_loop.create_window(attributes).context("create window")?,
         );
@@ -839,6 +857,46 @@ impl App {
             }
         }
         active.window.request_redraw();
+    }
+
+    // ── window control buttons ────────────────────────────────────────────
+
+    /// Returns which window button (if any) a physical-pixel point hits.
+    fn hit_window_btn(&self, p: Point) -> Option<WinBtn> {
+        let Some(chrome) = &self.chrome else { return None };
+        let tb = chrome.title_bar_rect();
+        if tb.height() < 2.0 {
+            return None;
+        }
+        // Buttons are in the top 32px of the title bar (the activity bar zone).
+        let btn_y0 = tb.y0;
+        let btn_y1 = tb.y0 + 32.0 * self.scale;
+        let x1 = tb.x1;
+        let s = self.scale;
+        let close = Rect::new(x1 - 40.0 * s, btn_y0, x1, btn_y1);
+        let maximize = Rect::new(x1 - 80.0 * s, btn_y0, x1 - 40.0 * s, btn_y1);
+        let minimize = Rect::new(x1 - 120.0 * s, btn_y0, x1 - 80.0 * s, btn_y1);
+        if close.contains(p) {
+            return Some(WinBtn::Close);
+        }
+        if maximize.contains(p) {
+            return Some(WinBtn::Maximize);
+        }
+        if minimize.contains(p) {
+            return Some(WinBtn::Minimize);
+        }
+        None
+    }
+
+    /// Whether a point is in the title bar's draggable zone (not on a button).
+    fn is_title_drag_zone(&self, p: Point) -> bool {
+        let Some(chrome) = &self.chrome else { return false };
+        let tb = chrome.title_bar_rect();
+        // Drag zone: the activity bar area EXCLUDING the button zone.
+        let btn_zone_start = tb.x1 - 120.0 * self.scale;
+        let drag_rect =
+            Rect::new(tb.x0, tb.y0, btn_zone_start, tb.y0 + 32.0 * self.scale);
+        drag_rect.contains(p)
     }
 
     // ── keyboard ──────────────────────────────────────────────────────────
@@ -1619,6 +1677,13 @@ impl App {
             ("h" | "H", true) => {
                 // Phase 6: toggle time scrubber (Ctrl+Shift+H).
                 self.scrubber_open = !self.scrubber_open;
+                true
+            }
+            ("l" | "L", true) => {
+                // Phase 7: toggle logic panel (Ctrl+Shift+L).
+                if let Some(chrome) = &mut self.chrome {
+                    chrome.toggle_logic_panel();
+                }
                 true
             }
             (",", false) => {
@@ -2802,12 +2867,39 @@ impl App {
             chrome.paint(&mut self.scene);
         }
 
-        // Top menu bar (A3) over the title-bar strip.
-        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
-            let area = chrome.title_bar_rect();
-            let palette = chrome.palette();
-            self.menubar_hits =
-                text.paint_menu_bar(&mut self.scene, area, &MENU_BAR, self.menu_bar_open, &palette, self.scale);
+        // Top menu bar (A3) — paint calls disabled for new custom title bar.
+        // The menu hit-test data (menubar_hits) is kept empty so menu dropdowns
+        // still work via right-click and keyboard shortcuts; they just have no
+        // visible labels in the activity bar strip.
+        // if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+        //     let area = chrome.title_bar_rect();
+        //     let palette = chrome.palette();
+        //     self.menubar_hits =
+        //         text.paint_menu_bar(&mut self.scene, area, &MENU_BAR, self.menu_bar_open, &palette, self.scale);
+        // }
+
+        // Window control button hover glow.
+        if let Some(chrome) = &self.chrome {
+            let tb = chrome.title_bar_rect();
+            let s = self.scale;
+            let x1 = tb.x1;
+            let btn_y0 = tb.y0;
+            let btn_y1 = tb.y0 + 32.0 * s;
+            let btns = [
+                (WinBtn::Close,    Rect::new(x1 - 40.0 * s, btn_y0, x1,               btn_y1)),
+                (WinBtn::Maximize, Rect::new(x1 - 80.0 * s, btn_y0, x1 - 40.0 * s,   btn_y1)),
+                (WinBtn::Minimize, Rect::new(x1 - 120.0 * s, btn_y0, x1 - 80.0 * s,  btn_y1)),
+            ];
+            for (btn, rect) in &btns {
+                if self.window_btn_hover == Some(*btn) {
+                    let hover_color = if *btn == WinBtn::Close {
+                        eden_theme::Rgba8::rgba(0xE8, 0x34, 0x1C, 0x30)
+                    } else {
+                        eden_theme::Rgba8::rgba(0xFF, 0xFF, 0xFF, 0x12)
+                    };
+                    fill_rrect(&mut self.scene, *rect, 0.0, hover_color);
+                }
+            }
         }
 
         // Tab bar: overlay the open-document tabs over the tab strip background
@@ -3408,6 +3500,8 @@ impl ApplicationHandler for App {
                 }
                 self.tree_hover = self.tree_row_at(point);
                 self.update_menu_hover(point);
+                // Update window button hover state.
+                self.window_btn_hover = self.hit_window_btn(point);
                 self.cursor_still_since = Instant::now();
                 self.hover_requested_for = None;
                 if let Some(path) = &self.current_path.clone() {
@@ -3430,6 +3524,37 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } => {
+                let cursor_pt = self.cursor.unwrap_or(Point::ZERO);
+                // Window control buttons take priority over everything else.
+                if let Some(btn) = self.hit_window_btn(cursor_pt) {
+                    match btn {
+                        WinBtn::Close => {
+                            self.pending_quit = true;
+                        }
+                        WinBtn::Maximize => {
+                            self.window_maximized = !self.window_maximized;
+                            if let WindowState::Active(aw) = &self.state {
+                                aw.window.set_maximized(self.window_maximized);
+                            }
+                        }
+                        WinBtn::Minimize => {
+                            if let WindowState::Active(aw) = &self.state {
+                                aw.window.set_minimized(true);
+                            }
+                        }
+                    }
+                    if self.pending_quit {
+                        event_loop.exit();
+                    }
+                    return;
+                }
+                // Title bar drag zone — initiate OS window drag.
+                if self.is_title_drag_zone(cursor_pt) {
+                    if let WindowState::Active(aw) = &self.state {
+                        let _ = aw.window.drag_window();
+                    }
+                    return;
+                }
                 let changed = self.on_click();
                 if self.pending_quit {
                     event_loop.exit();

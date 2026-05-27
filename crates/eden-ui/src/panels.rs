@@ -1,28 +1,27 @@
 //! The editor chrome panels.
 //!
-//! These are deliberately content-light: Eden has no text renderer yet (that
-//! arrives in Phase 2), so each panel paints abstract placeholder shapes — bars
-//! and chips, never fake letterforms — to convey structure and let the theming
-//! and motion systems be seen working.
+//! Each panel widget is a pure background painter. Text content (tab labels,
+//! status text, file tree rows, etc.) is drawn over these rects by
+//! [`crate::TextSystem`] after `Chrome::paint` returns, so the text system can
+//! use cosmic-text for shaping without coupling into the panel layer.
 
-use eden_theme::Rgba8;
 use vello::Scene;
 use vello::kurbo::Rect;
 
 use crate::paint::{fill_rect, fill_rrect};
 use crate::widget::{PaintCtx, Widget};
 
-/// Returns `color` with its alpha replaced — for drawing faint placeholders.
-fn with_alpha(color: Rgba8, alpha: u8) -> Rgba8 {
-    Rgba8::rgba(color.r, color.g, color.b, alpha)
-}
-
-/// Draws a small rounded bar at an absolute position.
-fn bar(scene: &mut Scene, x: f64, y: f64, w: f64, h: f64, color: Rgba8) {
-    fill_rrect(scene, Rect::new(x, y, x + w, y + h), h.min(w) * 0.5, color);
-}
-
-/// The top bar: a brand mark on the left and the active-file chip centered.
+/// The top title bar, 68px tall (activity bar 32px + breadcrumb bar 36px).
+///
+/// Painting breakdown:
+/// - Top 32px (activity area): filled with `palette.background`.
+/// - Bottom 36px (breadcrumb area): filled with `palette.surface`.
+/// - A 1px horizontal hairline between the two zones.
+/// - A 1px hairline at the very bottom of the 68px area.
+/// - macOS-style window control circles (close/maximize/minimize) in the top-right.
+///
+/// The actual activity tabs and breadcrumb path text are rendered by
+/// [`crate::TextSystem`] on top.
 #[derive(Default)]
 pub struct TitleBar;
 
@@ -30,38 +29,68 @@ impl Widget for TitleBar {
     fn paint(&self, scene: &mut Scene, bounds: Rect, ctx: &PaintCtx) {
         let s = ctx.scale;
         let p = ctx.palette;
-        fill_rect(scene, bounds, p.surface_raised);
 
-        let cy = bounds.center().y;
-        // Brand dot.
-        let dot = 9.0 * s;
-        bar(scene, bounds.x0 + 16.0 * s, cy - dot / 2.0, dot, dot, p.accent);
+        // Logical heights of the two zones.
+        let activity_h = 32.0 * s;
 
-        // Centered file chip.
-        let chip_w = (220.0 * s).min(bounds.width() * 0.5);
-        let chip_h = 20.0 * s;
-        let chip_x = bounds.center().x - chip_w / 2.0;
-        let chip_y = cy - chip_h / 2.0;
-        fill_rrect(
+        // Activity area (top): background colour.
+        fill_rect(
             scene,
-            Rect::new(chip_x, chip_y, chip_x + chip_w, chip_y + chip_h),
-            8.0 * s,
+            Rect::new(bounds.x0, bounds.y0, bounds.x1, bounds.y0 + activity_h),
+            p.background,
+        );
+        // Breadcrumb area (bottom): surface colour.
+        fill_rect(
+            scene,
+            Rect::new(bounds.x0, bounds.y0 + activity_h, bounds.x1, bounds.y1),
             p.surface,
         );
-        // Filename placeholder inside the chip.
-        bar(
+
+        // Hairline divider between activity and breadcrumb zones.
+        let t = s.max(1.0);
+        fill_rect(
             scene,
-            chip_x + 14.0 * s,
-            cy - 3.0 * s,
-            chip_w - 28.0 * s,
-            6.0 * s,
-            with_alpha(p.text_muted, 0x9C),
+            Rect::new(bounds.x0, bounds.y0 + activity_h - t, bounds.x1, bounds.y0 + activity_h),
+            p.divider,
+        );
+
+        // Window control buttons — three circles in the top-right corner of the
+        // activity zone. Vertically centred in the 32px activity band.
+        // design: 12×12 logical px circles, 6px corner radius (fully round).
+        let cy = bounds.y0 + activity_h * 0.5;
+        let r = 6.0 * s;   // half-size (radius)
+        let d = 12.0 * s;  // diameter
+        // Close (red accent) — rightmost.
+        let close_cx = bounds.x1 - 16.0 * s;
+        fill_rrect(
+            scene,
+            Rect::new(close_cx - r, cy - r, close_cx + r, cy + r),
+            r,
+            p.accent,
+        );
+        // Maximize (dim) — middle.
+        let max_cx = bounds.x1 - 16.0 * s - d - 8.0 * s;
+        fill_rrect(
+            scene,
+            Rect::new(max_cx - r, cy - r, max_cx + r, cy + r),
+            r,
+            p.fg_dim,
+        );
+        // Minimize (dim) — leftmost.
+        let min_cx = bounds.x1 - 16.0 * s - 2.0 * (d + 8.0 * s);
+        fill_rrect(
+            scene,
+            Rect::new(min_cx - r, cy - r, min_cx + r, cy + r),
+            r,
+            p.fg_dim,
         );
     }
 }
 
-/// The left sidebar background. The interactive file tree is drawn over this
-/// rect by [`crate::TextSystem::paint_file_tree`], which owns the tree model.
+/// The left sidebar background.
+///
+/// The interactive file tree is drawn over this rect by
+/// [`crate::TextSystem::paint_file_tree`], which owns the tree model.
 #[derive(Default)]
 pub struct SidebarPanel;
 
@@ -74,21 +103,24 @@ impl Widget for SidebarPanel {
     }
 }
 
-/// The tab strip: background only. Real tab labels (filename text, accent
-/// underline) are painted by [`crate::TextSystem::paint_tab_bar`] after
-/// `Chrome::paint` returns, so the text system can use cosmic-text.
+/// The tab strip background.
+///
+/// Real tab labels (filename text, accent underlines) are painted by
+/// [`crate::TextSystem::paint_tab_bar`] after `Chrome::paint` returns, so the
+/// text system can use cosmic-text for shaping.
 #[derive(Default)]
 pub struct TabStrip;
 
 impl Widget for TabStrip {
     fn paint(&self, scene: &mut Scene, bounds: Rect, ctx: &PaintCtx) {
-        fill_rect(scene, bounds, ctx.palette.surface_raised);
+        fill_rect(scene, bounds, ctx.palette.tab_inactive);
     }
 }
 
-/// The editor canvas. Just the background — real text, gutter, selections, and
-/// carets are drawn over this rect by [`crate::TextSystem`], which owns the
-/// editor model and shaping.
+/// The editor canvas background.
+///
+/// Real text, gutter, selections, and carets are drawn over this rect by
+/// [`crate::TextSystem`], which owns the editor model and shaping.
 #[derive(Default)]
 pub struct EditorArea;
 
@@ -98,7 +130,9 @@ impl Widget for EditorArea {
     }
 }
 
-/// The terminal panel background. Real cell content is drawn over this by
+/// The terminal panel background.
+///
+/// Real cell content is drawn over this by
 /// [`crate::TextSystem::paint_terminal`].
 #[derive(Default)]
 pub struct TerminalPanel;
@@ -108,29 +142,20 @@ impl Widget for TerminalPanel {
         if bounds.height() < 2.0 {
             return;
         }
-        fill_rect(scene, bounds, with_alpha(ctx.palette.background, 0xF0));
+        fill_rect(scene, bounds, ctx.palette.background);
     }
 }
 
-/// The bottom status bar: a branch chip on the left, position/lang on the right.
+/// The bottom status bar background.
+///
+/// The real status content (branch, position, language) is rendered by
+/// [`crate::TextSystem::paint_status_bar`].
 #[derive(Default)]
 pub struct StatusBar;
 
 impl Widget for StatusBar {
     fn paint(&self, scene: &mut Scene, bounds: Rect, ctx: &PaintCtx) {
-        let s = ctx.scale;
-        let p = ctx.palette;
-        fill_rect(scene, bounds, p.status_bar);
-
-        let cy = bounds.center().y;
-        // Left: brand dot + branch placeholder.
-        let dot = 7.0 * s;
-        bar(scene, bounds.x0 + 12.0 * s, cy - dot / 2.0, dot, dot, p.accent);
-        bar(scene, bounds.x0 + 12.0 * s + dot + 8.0 * s, cy - 2.5 * s, 72.0 * s, 5.0 * s, with_alpha(p.text_muted, 0xB0));
-
-        // Right: position + language placeholders.
-        let right = bounds.x1 - 12.0 * s;
-        bar(scene, right - 56.0 * s, cy - 2.5 * s, 56.0 * s, 5.0 * s, with_alpha(p.text_muted, 0xB0));
-        bar(scene, right - 56.0 * s - 12.0 * s - 40.0 * s, cy - 2.5 * s, 40.0 * s, 5.0 * s, with_alpha(p.text_muted, 0x90));
+        fill_rect(scene, bounds, ctx.palette.status_bar);
     }
 }
+

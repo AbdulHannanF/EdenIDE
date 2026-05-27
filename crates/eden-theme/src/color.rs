@@ -23,6 +23,12 @@ pub struct Rgba8 {
     pub a: u8,
 }
 
+impl Default for Rgba8 {
+    fn default() -> Self {
+        Self::rgba(0, 0, 0, 0)
+    }
+}
+
 impl Rgba8 {
     /// An opaque colour from red, green, and blue channels.
     #[must_use]
