@@ -7,6 +7,9 @@ command-driven ergonomics, and the quiet confidence of native apps.
 
 ---
 
+<img width="1517" height="862" alt="Screenshot 2026-05-27 103432" src="https://github.com/user-attachments/assets/72139f05-f158-4443-a6a8-b179e33f2006" />
+
+
 ## What makes Eden different
 
 | Feature | Description |
