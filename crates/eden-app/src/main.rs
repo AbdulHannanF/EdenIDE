@@ -25,11 +25,12 @@ use eden_search::{FuzzyMatcher, SearchHit, SearchQuery, search_project};
 use eden_terminal::TerminalBackend;
 use eden_theme::Rgba8;
 use eden_ui::{
-    ActivityBarView, BreadcrumbView, Chrome, CmdEntry, CmdPaletteView, CompletionEntry,
-    CompletionView, DiffMark, Editor, EditorFrame, FindBarHits, FindBarView, GutterMark,
-    Highlighter, Highlights, LogicPanelView, LogicSymbol, MenuItemView, MinimapView,
-    PaletteView, SearchPanelView, SearchRowView, ScrubberView, SettingsToggle, SettingsView,
-    StatusBarView, TabHit, TabLabel, TerminalView, TextSystem, TreeRow, TreeView, fill_rrect,
+    Chrome, CmdEntry, CmdPaletteView, CompletionEntry, CompletionView, DemoScreen,
+    DemoStripView, DiffMark, Editor, EditorFrame, FindBarHits, FindBarView, GutterMark,
+    Highlighter, Highlights, LeftRailItem, LeftRailView, LogicPanelView, LogicSymbol,
+    MenuItemView, MinimapView, PaletteView, SearchPanelView, SearchRowView, ScrubberView,
+    SettingsToggle, SettingsView, StatusBarView, TabHit, TabLabel, TerminalView, TextSystem,
+    TopBarView, TreeRow, TreeView, fill_rrect,
 };
 use eden_vcs::{DiffKind, GitRepo};
 use eden_workspace::{FileTree, Project};
@@ -742,6 +743,11 @@ struct App {
     settings_open: bool,
     settings: SettingsState,
 
+    // Design: demo-screen navigation strip (DemoStrip / 9 screens).
+    demo_screen: DemoScreen,
+    /// Hit-test rects for demo strip tabs, refreshed each frame.
+    demo_strip_hits: Vec<(DemoScreen, Rect)>,
+
     // Phase 6: semantic minimap
     minimap_open: bool,
 
@@ -866,6 +872,8 @@ impl App {
             diff_marks: Vec::new(),
             settings_open: false,
             settings: SettingsState::default(),
+            demo_screen: DemoScreen::default(),
+            demo_strip_hits: Vec::new(),
             minimap_open: false,
             scrubber_open: false,
             scrubber_rect: None,
@@ -999,11 +1007,12 @@ impl App {
         }
         let s = self.scale;
         let x1 = tb.x1;
-        // Button circle centres (matching panels.rs paint positions).
-        let cy = tb.y0 + 16.0 * s;
-        let close_cx = x1 - 16.0 * s;
-        let max_cx = x1 - 36.0 * s;
-        let min_cx = x1 - 56.0 * s;
+        // Button circle centres — matching panels.rs TopBar paint positions.
+        // design: centre of 36px top bar = 18px from top.
+        let cy = tb.y0 + 18.0 * s;
+        let close_cx = x1 - 14.0 * s;
+        let max_cx   = x1 - 30.0 * s;
+        let min_cx   = x1 - 46.0 * s;
         let hr = 10.0 * s; // hit half-size
         let close = Rect::new(close_cx - hr, cy - hr, close_cx + hr, cy + hr);
         let maximize = Rect::new(max_cx - hr, cy - hr, max_cx + hr, cy + hr);
@@ -1025,9 +1034,10 @@ impl App {
         let Some(chrome) = &self.chrome else { return false };
         let tb = chrome.title_bar_rect();
         let s = self.scale;
-        // Drag zone: the activity bar area EXCLUDING the button zone (from min_cx leftward).
-        let btn_zone_start = tb.x1 - 66.0 * s; // min_cx - hr = x1-56-10
-        let drag_rect = Rect::new(tb.x0, tb.y0, btn_zone_start, tb.y0 + 32.0 * s);
+        // Drag zone: the full 36px top bar EXCLUDING the 56px button zone on the right.
+        // min_cx = x1 - 46s, hit radius = 10s → zone starts at x1 - 56s.
+        let btn_zone_start = tb.x1 - 56.0 * s;
+        let drag_rect = Rect::new(tb.x0, tb.y0, btn_zone_start, tb.y1);
         drag_rect.contains(p)
     }
 
@@ -2735,6 +2745,28 @@ impl App {
             return true;
         }
 
+        // Demo strip tab → switch active screen.
+        if let Some((screen, _)) = self.demo_strip_hits.iter().find(|(_, r)| r.contains(point)) {
+            let screen = *screen;
+            if let Some(chrome) = &mut self.chrome {
+                chrome.set_demo_screen(screen);
+            }
+            self.demo_screen = screen;
+            // Auto-open relevant panels for each screen.
+            match screen {
+                DemoScreen::Settings => self.settings_open = true,
+                DemoScreen::Terminal => {
+                    if let Some(chrome) = &mut self.chrome
+                        && !chrome.terminal_open()
+                    {
+                        chrome.toggle_terminal();
+                    }
+                }
+                _ => {}
+            }
+            return true;
+        }
+
         // Breadcrumb theme button → cycle theme.
         if self.breadcrumb_theme_hit.contains(point) {
             if let Some(chrome) = &mut self.chrome {
@@ -3047,17 +3079,54 @@ impl App {
             chrome.paint(&mut self.scene);
         }
 
-        // Menu bar in the breadcrumb zone (bottom 36px of the title bar).
-        // Rendered before the breadcrumb so we know where the menu ends.
+        // Demo strip (28px top): 9 screen navigation tabs.
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let strip_rect = chrome.demo_strip_rect();
+            let palette = chrome.palette();
+            self.demo_strip_hits = text.paint_demo_strip(
+                &mut self.scene,
+                strip_rect,
+                &DemoStripView { active: self.demo_screen },
+                &palette,
+                self.scale,
+            );
+        }
+
+        // Left activity rail (48px): Explorer / Search / Git / Run icons.
+        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
+            let rail_rect = chrome.left_rail_rect();
+            if rail_rect.width() > 2.0 {
+                let palette = chrome.palette();
+                let is_search = self.search_open;
+                let items = [
+                    LeftRailItem { icon: "\u{25A6}", active: !is_search },  // ▦ Files
+                    LeftRailItem { icon: "\u{25CE}", active: is_search },    // ◎ Search
+                    LeftRailItem { icon: "\u{2387}", active: false },         // ⎇ Git
+                    LeftRailItem { icon: "\u{25B7}", active: false },         // ▷ Run
+                    LeftRailItem { icon: "\u{2699}", active: self.settings_open }, // ⚙ Settings
+                ];
+                text.paint_left_rail(
+                    &mut self.scene,
+                    rail_rect,
+                    &LeftRailView { items: &items },
+                    &palette,
+                    self.scale,
+                );
+            }
+        }
+
+        // Menu bar in the top bar (36px title bar).
+        // Starts after the "EDEN" brand (~56px) and before the theme badge zone.
+        // Rendered before paint_top_bar so we know where the menu ends.
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
             let tb = chrome.title_bar_rect();
             let s = self.scale;
-            let activity_h = 32.0 * s;
-            // Start after "EDEN" brand (~60px) to avoid overlap.
+            // design: EDEN brand occupies ~56px at scale 1 (4 chars × 8.4px + 2×14px pad).
+            let brand_end = tb.x0 + 56.0 * s;
             let menu_area = Rect::new(
-                tb.x0 + 60.0 * s,
-                tb.y0 + activity_h,
-                tb.x1 - 140.0 * s, // leave room for theme button on right
+                brand_end,
+                tb.y0,
+                tb.x1 - 140.0 * s, // leave room for theme badge + window controls
                 tb.y1,
             );
             let palette = chrome.palette();
@@ -3076,12 +3145,13 @@ impl App {
             let tb = chrome.title_bar_rect();
             let s = self.scale;
             let x1 = tb.x1;
-            let cy = tb.y0 + 16.0 * s;
+            // design: centre of 36px top bar = 18px.
+            let cy = tb.y0 + 18.0 * s;
             let r = 9.0 * s;
             let btns = [
-                (WinBtn::Close,    Point::new(x1 - 16.0 * s, cy)),
-                (WinBtn::Maximize, Point::new(x1 - 36.0 * s, cy)),
-                (WinBtn::Minimize, Point::new(x1 - 56.0 * s, cy)),
+                (WinBtn::Close,    Point::new(x1 - 14.0 * s, cy)),
+                (WinBtn::Maximize, Point::new(x1 - 30.0 * s, cy)),
+                (WinBtn::Minimize, Point::new(x1 - 46.0 * s, cy)),
             ];
             for (btn, center) in &btns {
                 if self.window_btn_hover == Some(*btn) {
@@ -3100,30 +3170,7 @@ impl App {
             }
         }
 
-        // Activity bar (top 32px): EDEN brand + numbered section tabs + ⌘P·PALETTE.
-        if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
-            let area = chrome.title_bar_rect();
-            let palette = chrome.palette();
-            let active_section = if self.search_open {
-                "SEARCH"
-            } else if self.terminal.as_ref().is_some_and(|_| chrome.terminal_open()) {
-                "TERM"
-            } else {
-                "EDITOR"
-            };
-            text.paint_activity_bar(
-                &mut self.scene,
-                area,
-                &ActivityBarView {
-                    active: active_section,
-                    theme_name: chrome.active_theme_name(),
-                },
-                &palette,
-                self.scale,
-            );
-        }
-
-        // Breadcrumb bar (bottom 36px of title bar): menu bar + file path + theme button.
+        // Top bar (36px): "EDEN" brand + file breadcrumb + "◇ THEME" badge.
         // menu_end_x comes from the last menubar_hits rect so the path starts after the menu.
         let menu_end_x = self.menubar_hits.last().map(|r| r.x1).unwrap_or(0.0);
         if let (Some(text), Some(chrome)) = (&mut self.text, &self.chrome) {
@@ -3134,10 +3181,10 @@ impl App {
                     r.to_string_lossy().replace('\\', "/")
                 })
             });
-            self.breadcrumb_theme_hit = text.paint_breadcrumb(
+            self.breadcrumb_theme_hit = text.paint_top_bar(
                 &mut self.scene,
                 area,
-                &BreadcrumbView {
+                &TopBarView {
                     path: rel_path.as_deref(),
                     theme_name: chrome.active_theme_name(),
                     menu_end_x,

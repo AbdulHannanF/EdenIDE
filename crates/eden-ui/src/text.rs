@@ -18,6 +18,7 @@ use vello::kurbo::{Affine, Point, Rect};
 use vello::peniko::{Blob, Fill, FontData};
 use vello::{Glyph, Scene};
 
+use crate::chrome::DemoScreen;
 use crate::paint::{fill_rect, fill_rrect, to_color};
 
 // design: editor type at 14px logical, line height 1.55 (§6: "never compress").
@@ -2140,6 +2141,192 @@ impl TextSystem {
         hits
     }
 
+    // ── demo strip ────────────────────────────────────────────────────────
+
+    /// Paints the 28px prototype demo-screen navigation strip.
+    ///
+    /// Each of the 9 screen tabs shows its number + label. The active tab gets
+    /// a translucent accent pill background and bright text; inactive tabs are
+    /// dimmed. Returns hit-test rects for each tab so the caller can route clicks.
+    pub fn paint_demo_strip(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &DemoStripView,
+        palette: &Palette,
+        scale: f64,
+    ) -> Vec<(DemoScreen, Rect)> {
+        self.ensure_metrics(scale);
+        let h = area.height();
+        let baseline = area.y0 + (h + self.font_size_px * 0.72) * 0.5;
+        let screens = DemoScreen::all();
+        let tab_w = area.width() / screens.len() as f64;
+        let mut hits = Vec::with_capacity(screens.len());
+
+        for (i, screen) in screens.iter().enumerate() {
+            let x0 = area.x0 + i as f64 * tab_w;
+            let x1 = x0 + tab_w;
+            let tab_rect = Rect::new(x0, area.y0, x1, area.y1);
+            let is_active = *screen == view.active;
+
+            if is_active {
+                // design: translucent accent pill under the active tab.
+                fill_rrect(
+                    scene,
+                    Rect::new(x0 + 4.0 * scale, area.y0 + 3.0 * scale,
+                              x1 - 4.0 * scale, area.y1 - 3.0 * scale),
+                    4.0 * scale,
+                    with_alpha(palette.accent, 0x30),
+                );
+            }
+
+            let label = format!("{} {}", screen.number(), screen.label());
+            let text_w = label.chars().count() as f64 * self.advance;
+            let text_x = x0 + (tab_w - text_w) * 0.5;
+            let color = if is_active {
+                palette.text
+            } else {
+                with_alpha(palette.text_muted, 0x90)
+            };
+            self.draw_text(scene, &label, text_x.max(x0 + 2.0 * scale), baseline, color);
+
+            // Accent underline on the active tab.
+            if is_active {
+                fill_rect(
+                    scene,
+                    Rect::new(x0 + 6.0 * scale, area.y1 - 2.0 * scale,
+                              x1 - 6.0 * scale, area.y1),
+                    with_alpha(palette.accent, 0xC0),
+                );
+            }
+
+            hits.push((*screen, tab_rect));
+        }
+        hits
+    }
+
+    // ── top bar ───────────────────────────────────────────────────────────
+
+    /// Paints the 36px top bar: "EDEN" brand on the left, file breadcrumb in
+    /// the centre (anchored after the menu bar), and "◇ THEME" badge on the
+    /// right before the window-control zone.
+    ///
+    /// Returns the hit rect for the theme-cycle button so the caller can route
+    /// clicks to [`Chrome::cycle_theme`].
+    pub fn paint_top_bar(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &TopBarView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) -> Rect {
+        self.ensure_metrics(scale);
+        let baseline = area.y0 + (area.height() + self.font_size_px * 0.72) * 0.5;
+        let pad = 14.0 * scale;
+
+        // Left: "EDEN" brand in accent.
+        self.draw_text(scene, "EDEN", area.x0 + pad, baseline, palette.accent);
+
+        // Right: theme badge before the 80px window-control zone.
+        let win_zone = 80.0 * scale;
+        let theme_label = format!("\u{25CC} {}", view.theme_name);
+        let theme_w = theme_label.chars().count() as f64 * self.advance;
+        let theme_x = area.x1 - win_zone - theme_w - pad;
+        self.draw_text(scene, &theme_label, theme_x, baseline, with_alpha(palette.fg_dim, 0xA0));
+        let theme_hit = Rect::new(theme_x - 4.0 * scale, area.y0,
+                                  theme_x + theme_w + 4.0 * scale, area.y1);
+
+        // Centre: file breadcrumb path, anchored after menu_end_x.
+        let path_x0 = if view.menu_end_x > area.x0 + pad {
+            view.menu_end_x + 16.0 * scale
+        } else {
+            // No menu bar: start after "EDEN " brand.
+            area.x0 + pad + 4.0 * self.advance + pad
+        };
+        let path_x1 = theme_x - 8.0 * scale;
+
+        if let Some(path) = view.path {
+            let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if !segs.is_empty() {
+                let sep = " / ";
+                let sep_w = sep.chars().count() as f64 * self.advance;
+                let total_w: f64 = segs.iter()
+                    .map(|s| s.chars().count() as f64 * self.advance)
+                    .sum::<f64>()
+                    + sep_w * (segs.len().saturating_sub(1)) as f64;
+                let start_x = (path_x1 - total_w).max(path_x0);
+                let mut cx = start_x;
+                for (i, seg) in segs.iter().enumerate() {
+                    if i > 0 {
+                        self.draw_text(scene, sep, cx, baseline, palette.fg_dim);
+                        cx += sep_w;
+                    }
+                    let color = if i == segs.len() - 1 {
+                        palette.text_muted
+                    } else {
+                        palette.fg_dim
+                    };
+                    self.draw_text(scene, seg, cx, baseline, color);
+                    cx += seg.chars().count() as f64 * self.advance;
+                }
+            }
+        }
+
+        theme_hit
+    }
+
+    // ── left rail ─────────────────────────────────────────────────────────
+
+    /// Paints the 48px-wide left activity rail.
+    ///
+    /// Each item is centred vertically in its 48×48 cell. The active item gets
+    /// a left-edge accent pip (4×16px) and brighter icon text.
+    pub fn paint_left_rail(
+        &mut self,
+        scene: &mut Scene,
+        area: Rect,
+        view: &LeftRailView<'_>,
+        palette: &Palette,
+        scale: f64,
+    ) {
+        self.ensure_metrics(scale);
+        let cell_h = 48.0 * scale;
+
+        for (i, item) in view.items.iter().enumerate() {
+            let y0 = area.y0 + i as f64 * cell_h;
+            let y1 = y0 + cell_h;
+            let cell = Rect::new(area.x0, y0, area.x1, y1);
+            if cell.y0 > area.y1 { break; }
+
+            if item.active {
+                // design: 4px accent pip on the left edge of the active icon cell.
+                fill_rrect(
+                    scene,
+                    Rect::new(area.x0, y0 + 12.0 * scale, area.x0 + 3.0 * scale, y1 - 12.0 * scale),
+                    1.5 * scale,
+                    palette.accent,
+                );
+                // Subtle background tint on active cell.
+                fill_rect(
+                    scene,
+                    Rect::new(area.x0 + 4.0 * scale, y0, area.x1, y1),
+                    with_alpha(palette.accent, 0x14),
+                );
+            }
+
+            let color = if item.active {
+                palette.text
+            } else {
+                with_alpha(palette.fg_dim, 0xA0)
+            };
+            let icon_w = item.icon.chars().count() as f64 * self.advance;
+            let ix = area.x0 + (area.width() - icon_w) * 0.5;
+            let baseline = y0 + (cell_h + self.font_size_px * 0.72) * 0.5;
+            self.draw_text(scene, item.icon, ix, baseline, color);
+        }
+    }
+
     // ── shared drawing helpers ────────────────────────────────────────────
 
     /// Draws a single line of UI text with its baseline at `baseline`.
@@ -2435,6 +2622,44 @@ pub struct ScrubberView {
     pub undo_pos: usize,
     /// Total history depth (undo + redo steps).
     pub total: usize,
+}
+
+// ── demo strip view ───────────────────────────────────────────────────────────
+
+/// Everything needed to render the 28px prototype demo-screen navigation strip.
+pub struct DemoStripView {
+    /// The currently active screen (its tab is highlighted).
+    pub active: DemoScreen,
+}
+
+// ── top bar view ──────────────────────────────────────────────────────────────
+
+/// Everything needed to render the 36px top bar (replaces old 68px title bar).
+pub struct TopBarView<'a> {
+    /// Optional file path (relative, forward-slash separated) for the breadcrumb.
+    pub path: Option<&'a str>,
+    /// Name of the active theme for the right-side badge.
+    pub theme_name: &'a str,
+    /// Physical x coordinate where the menu bar ends (breadcrumb path anchors here).
+    ///
+    /// Pass `0.0` when there is no menu bar; the path falls back to a fixed left margin.
+    pub menu_end_x: f64,
+}
+
+// ── left rail ─────────────────────────────────────────────────────────────────
+
+/// A single icon entry in the 48px left activity rail.
+pub struct LeftRailItem {
+    /// Short glyph or text drawn as the icon (should be 1–2 chars for best fit).
+    pub icon: &'static str,
+    /// Whether this is the currently active section (draws an accent pip + tint).
+    pub active: bool,
+}
+
+/// Everything needed to render the 48px left activity rail.
+pub struct LeftRailView<'a> {
+    /// Items in order, from top to bottom.
+    pub items: &'a [LeftRailItem],
 }
 
 // ── per-glyph data ────────────────────────────────────────────────────────────
